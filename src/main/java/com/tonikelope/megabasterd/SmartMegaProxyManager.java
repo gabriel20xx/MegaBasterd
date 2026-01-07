@@ -276,25 +276,46 @@ public final class SmartMegaProxyManager {
 
                     for (String proxy : custom_list) {
 
-                        boolean socks = false;
-
-                        if (proxy.trim().startsWith("*")) {
-                            socks = true;
-
-                            proxy = proxy.trim().substring(1);
+                        if (proxy == null) {
+                            continue;
                         }
 
-                        if (proxy.trim().contains("@")) {
+                        proxy = proxy.trim();
 
-                            String[] proxy_parts = proxy.trim().split("@");
+                        if (proxy.isEmpty()) {
+                            continue;
+                        }
 
-                            custom_clean_list_auth.put(proxy_parts[0], proxy_parts[1]);
+                        boolean socks = false;
+
+                        if (proxy.startsWith("*")) {
+                            socks = true;
+
+                            proxy = proxy.substring(1).trim();
+                        }
+
+                        if (proxy.contains("@")) {
+
+                            String[] proxy_parts = proxy.split("@");
+
+                            if (proxy_parts.length < 2) {
+                                continue;
+                            }
+
+                            String proxy_key = proxy_parts[0].trim();
+                            String proxy_auth = proxy_parts[1].trim();
+
+                            if (proxy_key.isEmpty()) {
+                                continue;
+                            }
+
+                            custom_clean_list_auth.put(proxy_key, proxy_auth);
 
                             Long[] proxy_data = new Long[]{-1L, socks ? 1L : -1L};
 
-                            custom_clean_list.put(proxy_parts[0], proxy_data);
+                            custom_clean_list.put(proxy_key, proxy_data);
 
-                        } else if (proxy.trim().matches(".+?:[0-9]{1,5}")) {
+                        } else if (proxy.matches(".+?:[0-9]{1,5}")) {
 
                             Long[] proxy_data = new Long[]{-1L, socks ? 1L : -1L};
 
@@ -347,36 +368,65 @@ public final class SmartMegaProxyManager {
 
                 if (proxy_list.length > 0) {
 
-                    _proxy_list.clear();
+                    LinkedHashMap<String, Long[]> url_clean_list = new LinkedHashMap<>();
 
-                    PROXY_LIST_AUTH.clear();
+                    HashMap<String, String> url_clean_list_auth = new HashMap<>();
 
                     for (String proxy : proxy_list) {
 
-                        boolean socks = false;
-
-                        if (proxy.trim().startsWith("*")) {
-                            socks = true;
-
-                            proxy = proxy.trim().substring(1);
+                        if (proxy == null) {
+                            continue;
                         }
 
-                        if (proxy.trim().contains("@")) {
+                        proxy = proxy.trim();
 
-                            String[] proxy_parts = proxy.trim().split("@");
+                        if (proxy.isEmpty()) {
+                            continue;
+                        }
 
-                            PROXY_LIST_AUTH.put(proxy_parts[0], proxy_parts[1]);
+                        boolean socks = false;
+
+                        if (proxy.startsWith("*")) {
+                            socks = true;
+
+                            proxy = proxy.substring(1).trim();
+                        }
+
+                        if (proxy.contains("@")) {
+
+                            String[] proxy_parts = proxy.split("@");
+
+                            if (proxy_parts.length < 2) {
+                                continue;
+                            }
+
+                            String proxy_key = proxy_parts[0].trim();
+                            String proxy_auth = proxy_parts[1].trim();
+
+                            if (proxy_key.isEmpty()) {
+                                continue;
+                            }
+
+                            url_clean_list_auth.put(proxy_key, proxy_auth);
 
                             Long[] proxy_data = new Long[]{-1L, socks ? 1L : -1L};
 
-                            _proxy_list.put(proxy_parts[0], proxy_data);
+                            url_clean_list.put(proxy_key, proxy_data);
 
-                        } else if (proxy.trim().matches(".+?:[0-9]{1,5}")) {
+                        } else if (proxy.matches(".+?:[0-9]{1,5}")) {
                             Long[] proxy_data = new Long[]{-1L, socks ? 1L : -1L};
-                            _proxy_list.put(proxy, proxy_data);
+                            url_clean_list.put(proxy, proxy_data);
                         }
 
                     }
+
+                    _proxy_list.clear();
+
+                    _proxy_list.putAll(url_clean_list);
+
+                    PROXY_LIST_AUTH.clear();
+
+                    PROXY_LIST_AUTH.putAll(url_clean_list_auth);
                 }
 
                 _main_panel.getView().updateSmartProxyStatus("SmartProxy: ON (" + String.valueOf(getProxyCount()) + ")" + (this.isForce_smart_proxy() ? " F!" : ""));
