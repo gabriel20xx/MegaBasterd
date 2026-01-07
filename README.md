@@ -22,3 +22,27 @@
 <p align="center"><a href="https://github.com/tonikelope/megabasterd/issues/385#issuecomment-1019215670">BONUS: Why the f*ck has MegaBasterd stopped downloading?</a></p>
 
 <p align="center"><b>IMPORTANT:</b> You are not authorized to use MegaBasterd in any way that violates <a href="https://mega.io/es/terms"><b>MEGA's terms of use</b></a>.</p>
+
+## Docker (browser-accessible UI)
+
+This repository can be run in a Docker container and accessed from a browser via **noVNC** (the existing Swing UI is rendered in a virtual X server).
+
+### Quick start (docker compose)
+
+```bash
+docker compose up --build
+```
+
+Then open:
+
+- http://localhost:6080/vnc.html
+
+Downloads and app configuration are persisted under:
+
+- `./docker-data/downloads`
+- `./docker-data/config`
+
+### Notes
+
+- noVNC is exposed **without authentication** in this setup. Only bind/publish it to trusted networks.
+- If you change the container port mapping, update the URL accordingly.

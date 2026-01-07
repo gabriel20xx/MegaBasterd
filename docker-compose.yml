@@ -1,0 +1,10 @@
+services:
+  megabasterd:
+    build: .
+    container_name: megabasterd
+    ports:
+      - "6080:6080"
+    volumes:
+      - ./docker-data/config:/config
+      - ./docker-data/downloads:/downloads
+    restart: unless-stopped
