@@ -18,6 +18,7 @@ RUN apt-get update \
         iproute2 \
         iptables \
         novnc \
+        openresolv \
         strongswan \
         libcharon-extra-plugins \
         wireguard-tools \
