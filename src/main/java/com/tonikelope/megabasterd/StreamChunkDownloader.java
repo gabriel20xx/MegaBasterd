@@ -58,7 +58,7 @@ public class StreamChunkDownloader implements Runnable {
 
             String current_smart_proxy = null;
 
-            boolean smart_proxy_socks = false;
+            String smart_proxy_protocol = "http";
 
             long offset = -1;
 
@@ -72,7 +72,18 @@ public class StreamChunkDownloader implements Runnable {
 
                 current_smart_proxy = smart_proxy[0];
 
-                smart_proxy_socks = smart_proxy[1].equals("socks");
+                smart_proxy_protocol = smart_proxy[1];
+
+                while (current_smart_proxy != null && "ikev2".equals(smart_proxy_protocol) && !proxy_manager.ensureIkev2Connected(current_smart_proxy)) {
+                    proxy_manager.blockProxy(current_smart_proxy, "IKEv2 connect failed");
+                    String[] next = proxy_manager.getProxy(excluded_proxy_list);
+                    if (next == null) {
+                        current_smart_proxy = null;
+                        break;
+                    }
+                    current_smart_proxy = next[0];
+                    smart_proxy_protocol = next[1];
+                }
             }
 
             while (!_exit && !_chunkmanager.isExit()) {
@@ -107,7 +118,7 @@ public class StreamChunkDownloader implements Runnable {
 
                             current_smart_proxy = smart_proxy[0];
 
-                            smart_proxy_socks = smart_proxy[1].equals("socks");
+                            smart_proxy_protocol = smart_proxy[1];
 
                         } else if (current_smart_proxy == null) {
 
@@ -115,19 +126,31 @@ public class StreamChunkDownloader implements Runnable {
 
                             current_smart_proxy = smart_proxy[0];
 
-                            smart_proxy_socks = smart_proxy[1].equals("socks");
+                            smart_proxy_protocol = smart_proxy[1];
 
                         }
 
+                        while (current_smart_proxy != null && "ikev2".equals(smart_proxy_protocol) && !proxy_manager.ensureIkev2Connected(current_smart_proxy)) {
+                            proxy_manager.blockProxy(current_smart_proxy, "IKEv2 connect failed");
+                            String[] next = proxy_manager.getProxy(excluded_proxy_list);
+                            if (next == null) {
+                                current_smart_proxy = null;
+                                break;
+                            }
+                            current_smart_proxy = next[0];
+                            smart_proxy_protocol = next[1];
+                        }
+
                         if (current_smart_proxy != null) {
-
-                            String[] proxy_info = current_smart_proxy.split(":");
-
-                            Proxy proxy = new Proxy(smart_proxy_socks ? Proxy.Type.SOCKS : Proxy.Type.HTTP, new InetSocketAddress(proxy_info[0], Integer.parseInt(proxy_info[1])));
-
                             URL chunk_url = new URL(chunk_stream.getUrl());
 
-                            con = (HttpURLConnection) chunk_url.openConnection(proxy);
+                            if ("ikev2".equals(smart_proxy_protocol)) {
+                                con = (HttpURLConnection) chunk_url.openConnection();
+                            } else {
+                                String[] proxy_info = current_smart_proxy.split(":");
+                                Proxy proxy = new Proxy("socks".equals(smart_proxy_protocol) ? Proxy.Type.SOCKS : Proxy.Type.HTTP, new InetSocketAddress(proxy_info[0], Integer.parseInt(proxy_info[1])));
+                                con = (HttpURLConnection) chunk_url.openConnection(proxy);
+                            }
 
                         } else {
 
@@ -142,7 +165,7 @@ public class StreamChunkDownloader implements Runnable {
 
                         if (MainPanel.isUse_proxy()) {
 
-                            con = (HttpURLConnection) chunk_url.openConnection(new Proxy(smart_proxy_socks ? Proxy.Type.SOCKS : Proxy.Type.HTTP, new InetSocketAddress(MainPanel.getProxy_host(), MainPanel.getProxy_port())));
+                            con = (HttpURLConnection) chunk_url.openConnection(new Proxy(Proxy.Type.HTTP, new InetSocketAddress(MainPanel.getProxy_host(), MainPanel.getProxy_port())));
 
                             if (MainPanel.getProxy_user() != null && !"".equals(MainPanel.getProxy_user())) {
 
@@ -152,11 +175,13 @@ public class StreamChunkDownloader implements Runnable {
 
                             if (current_smart_proxy != null) {
 
-                                String[] proxy_info = current_smart_proxy.split(":");
-
-                                Proxy proxy = new Proxy(smart_proxy_socks ? Proxy.Type.SOCKS : Proxy.Type.HTTP, new InetSocketAddress(proxy_info[0], Integer.parseInt(proxy_info[1])));
-
-                                con = (HttpURLConnection) chunk_url.openConnection(proxy);
+                                if ("ikev2".equals(smart_proxy_protocol)) {
+                                    con = (HttpURLConnection) chunk_url.openConnection();
+                                } else {
+                                    String[] proxy_info = current_smart_proxy.split(":");
+                                    Proxy proxy = new Proxy("socks".equals(smart_proxy_protocol) ? Proxy.Type.SOCKS : Proxy.Type.HTTP, new InetSocketAddress(proxy_info[0], Integer.parseInt(proxy_info[1])));
+                                    con = (HttpURLConnection) chunk_url.openConnection(proxy);
+                                }
 
                             } else {
                                 con = (HttpURLConnection) chunk_url.openConnection();

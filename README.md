@@ -46,3 +46,14 @@ Downloads and app configuration are persisted under:
 
 - noVNC is exposed **without authentication** in this setup. Only bind/publish it to trusted networks.
 - If you change the container port mapping, update the URL accordingly.
+- The container starts MegaBasterd with working directory `/downloads` so the default download folder `.` is persisted across restarts.
+
+### SmartProxy + IKEv2 (inside Docker)
+
+The Docker setup supports using **IKEv2 (IPsec) VPN tunnels** as SmartProxy entries.
+
+- Compose must grant the container `NET_ADMIN` (and usually `NET_RAW`).
+- Add IKEv2 lines to the SmartProxy custom list using:
+	- `ikev2://username:password@hostname`
+
+MegaBasterd will establish the tunnel (via **strongSwan**) when that entry is selected.

@@ -3,6 +3,10 @@ set -euo pipefail
 
 mkdir -p /config /downloads
 
+# Make sure the default download directory (".") is persisted.
+# MegaBasterd uses "." as default when no default_down_dir is set.
+cd /downloads
+
 # Virtual display
 Xvfb :0 -screen 0 1280x720x24 -nolisten tcp &
 

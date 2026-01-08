@@ -148,7 +148,8 @@ public class ChunkDownloader implements Runnable, SecureSingleThreadNotifiable {
 
             int http_error = 0, http_status = -1, conta_error = 0;
 
-            boolean chunk_error = false, timeout = false, smart_proxy_socks = false;
+            boolean chunk_error = false, timeout = false;
+            String smart_proxy_protocol = "http";
 
             String worker_url = null;
 
@@ -208,7 +209,7 @@ public class ChunkDownloader implements Runnable, SecureSingleThreadNotifiable {
 
                         _current_smart_proxy = smart_proxy[0];
 
-                        smart_proxy_socks = smart_proxy[1].equals("socks");
+                        smart_proxy_protocol = smart_proxy[1];
 
                     } else if (_current_smart_proxy == null) {
 
@@ -216,8 +217,19 @@ public class ChunkDownloader implements Runnable, SecureSingleThreadNotifiable {
 
                         _current_smart_proxy = smart_proxy[0];
 
-                        smart_proxy_socks = smart_proxy[1].equals("socks");
+                        smart_proxy_protocol = smart_proxy[1];
 
+                    }
+
+                    while (_current_smart_proxy != null && "ikev2".equals(smart_proxy_protocol) && !proxy_manager.ensureIkev2Connected(_current_smart_proxy)) {
+                        proxy_manager.blockProxy(_current_smart_proxy, "IKEv2 connect failed");
+                        String[] next = proxy_manager.getProxy(_excluded_proxy_list);
+                        if (next == null) {
+                            _current_smart_proxy = null;
+                            break;
+                        }
+                        _current_smart_proxy = next[0];
+                        smart_proxy_protocol = next[1];
                     }
 
                     if (_current_smart_proxy != null) {
@@ -226,13 +238,15 @@ public class ChunkDownloader implements Runnable, SecureSingleThreadNotifiable {
                             getDownload().enableTurboMode();
                         }
 
-                        String[] proxy_info = _current_smart_proxy.split(":");
-
-                        Proxy proxy = new Proxy(smart_proxy_socks ? Proxy.Type.SOCKS : Proxy.Type.HTTP, new InetSocketAddress(proxy_info[0], Integer.parseInt(proxy_info[1])));
-
                         URL url = new URL(chunk_url);
 
-                        con = (HttpURLConnection) url.openConnection(proxy);
+                        if ("ikev2".equals(smart_proxy_protocol)) {
+                            con = (HttpURLConnection) url.openConnection();
+                        } else {
+                            String[] proxy_info = _current_smart_proxy.split(":");
+                            Proxy proxy = new Proxy("socks".equals(smart_proxy_protocol) ? Proxy.Type.SOCKS : Proxy.Type.HTTP, new InetSocketAddress(proxy_info[0], Integer.parseInt(proxy_info[1])));
+                            con = (HttpURLConnection) url.openConnection(proxy);
+                        }
 
                     } else {
 
@@ -251,7 +265,7 @@ public class ChunkDownloader implements Runnable, SecureSingleThreadNotifiable {
 
                         _current_smart_proxy = null;
 
-                        con = (HttpURLConnection) url.openConnection(new Proxy(smart_proxy_socks ? Proxy.Type.SOCKS : Proxy.Type.HTTP, new InetSocketAddress(MainPanel.getProxy_host(), MainPanel.getProxy_port())));
+                        con = (HttpURLConnection) url.openConnection(new Proxy(Proxy.Type.HTTP, new InetSocketAddress(MainPanel.getProxy_host(), MainPanel.getProxy_port())));
 
                         if (MainPanel.getProxy_user() != null && !"".equals(MainPanel.getProxy_user())) {
 

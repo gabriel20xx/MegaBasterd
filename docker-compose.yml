@@ -2,6 +2,9 @@ services:
   megabasterd:
     build: .
     container_name: megabasterd
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
     ports:
       - "6080:6080"
     volumes:

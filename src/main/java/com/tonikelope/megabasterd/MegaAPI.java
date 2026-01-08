@@ -374,7 +374,8 @@ public class MegaAPI implements Serializable {
 
         int mega_error = 0, http_error = 0, conta_error = 0, http_status;
 
-        boolean empty_response = false, smart_proxy_socks = false;
+        boolean empty_response = false;
+        String smart_proxy_protocol = "http";
 
         HttpsURLConnection con = null;
 
@@ -396,7 +397,7 @@ public class MegaAPI implements Serializable {
 
                         current_smart_proxy = smart_proxy[0];
 
-                        smart_proxy_socks = smart_proxy[1].equals("socks");
+                        smart_proxy_protocol = smart_proxy[1];
 
                     } else if (current_smart_proxy == null) {
 
@@ -404,16 +405,29 @@ public class MegaAPI implements Serializable {
 
                         current_smart_proxy = smart_proxy[0];
 
-                        smart_proxy_socks = smart_proxy[1].equals("socks");
+                        smart_proxy_protocol = smart_proxy[1];
+                    }
+
+                    while (current_smart_proxy != null && "ikev2".equals(smart_proxy_protocol) && !proxy_manager.ensureIkev2Connected(current_smart_proxy)) {
+                        proxy_manager.blockProxy(current_smart_proxy, "IKEv2 connect failed");
+                        String[] next = proxy_manager.getProxy(excluded_proxy_list);
+                        if (next == null) {
+                            current_smart_proxy = null;
+                            break;
+                        }
+                        current_smart_proxy = next[0];
+                        smart_proxy_protocol = next[1];
                     }
 
                     if (current_smart_proxy != null) {
 
-                        String[] proxy_info = current_smart_proxy.split(":");
-
-                        Proxy proxy = new Proxy(smart_proxy_socks ? Proxy.Type.SOCKS : Proxy.Type.HTTP, new InetSocketAddress(proxy_info[0], Integer.parseInt(proxy_info[1])));
-
-                        con = (HttpsURLConnection) url_api.openConnection(proxy);
+                        if ("ikev2".equals(smart_proxy_protocol)) {
+                            con = (HttpsURLConnection) url_api.openConnection();
+                        } else {
+                            String[] proxy_info = current_smart_proxy.split(":");
+                            Proxy proxy = new Proxy("socks".equals(smart_proxy_protocol) ? Proxy.Type.SOCKS : Proxy.Type.HTTP, new InetSocketAddress(proxy_info[0], Integer.parseInt(proxy_info[1])));
+                            con = (HttpsURLConnection) url_api.openConnection(proxy);
+                        }
 
                     } else {
 
@@ -424,7 +438,7 @@ public class MegaAPI implements Serializable {
 
                     if (MainPanel.isUse_proxy()) {
 
-                        con = (HttpsURLConnection) url_api.openConnection(new Proxy(smart_proxy_socks ? Proxy.Type.SOCKS : Proxy.Type.HTTP, new InetSocketAddress(MainPanel.getProxy_host(), MainPanel.getProxy_port())));
+                        con = (HttpsURLConnection) url_api.openConnection(new Proxy(Proxy.Type.HTTP, new InetSocketAddress(MainPanel.getProxy_host(), MainPanel.getProxy_port())));
 
                         if (MainPanel.getProxy_user() != null && !"".equals(MainPanel.getProxy_user())) {
 

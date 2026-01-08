@@ -15,7 +15,10 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
         fluxbox \
+        iproute2 \
         novnc \
+        strongswan \
+        libcharon-extra-plugins \
         websockify \
         x11vnc \
         xvfb \
