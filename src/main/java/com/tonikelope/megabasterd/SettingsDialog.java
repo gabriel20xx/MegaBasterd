@@ -27,12 +27,14 @@ import java.io.InputStream;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.security.InvalidAlgorithmParameterException;
 import java.security.InvalidKeyException;
 import java.security.NoSuchAlgorithmException;
 import java.sql.SQLException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -66,6 +68,9 @@ import javax.swing.table.DefaultTableModel;
 public class SettingsDialog extends javax.swing.JDialog {
 
     public static final String DEFAULT_SMART_PROXY_URL = "https://raw.githubusercontent.com/tonikelope/megabasterd/proxy_list/proxy_list.txt";
+
+    private static final String AUTOWG_BEGIN = "# [MegaBasterd] Auto-discovered WireGuard configs from /wireguard (do not edit below)";
+    private static final String AUTOWG_END = "# [MegaBasterd] End auto-discovered WireGuard configs";
     private String _download_path;
     private String _custom_chunks_dir;
     private boolean _settings_ok;
@@ -754,9 +759,7 @@ public class SettingsDialog extends javax.swing.JDialog {
 
             String custom_proxy_list = DBTools.selectSettingValue("custom_proxy_list");
 
-            if (custom_proxy_list != null) {
-                custom_proxy_textarea.setText(custom_proxy_list);
-            }
+            custom_proxy_textarea.setText(mergeCustomProxyListWithAutoWireguard(custom_proxy_list));
 
             revalidate();
 
@@ -2055,6 +2058,92 @@ public class SettingsDialog extends javax.swing.JDialog {
         pack();
     }// </editor-fold>//GEN-END:initComponents
 
+    private static List<String> discoverWireguardSmartProxyEntries() {
+        Path wgDir = Paths.get("/wireguard");
+
+        try {
+            if (!Files.isDirectory(wgDir)) {
+                return Collections.emptyList();
+            }
+
+            try (Stream<Path> stream = Files.list(wgDir)) {
+                return stream
+                        .filter(p -> {
+                            try {
+                                return Files.isRegularFile(p);
+                            } catch (Exception ignored) {
+                                return false;
+                            }
+                        })
+                        .map(p -> p.getFileName() != null ? p.getFileName().toString() : "")
+                        .filter(name -> name.toLowerCase().endsWith(".conf"))
+                        .map(name -> {
+                            String base = name.substring(0, name.length() - 5);
+                            return "wireguard://" + base;
+                        })
+                        .sorted()
+                        .collect(Collectors.toList());
+            }
+
+        } catch (Exception ignored) {
+            return Collections.emptyList();
+        }
+    }
+
+    private static String stripAutoWireguardBlock(String text) {
+        if (text == null || text.isEmpty()) {
+            return "";
+        }
+
+        int begin = text.indexOf(AUTOWG_BEGIN);
+        if (begin < 0) {
+            return text;
+        }
+
+        int end = text.indexOf(AUTOWG_END, begin);
+        if (end < 0) {
+            // If the end marker is missing, strip from begin to end-of-text.
+            return text.substring(0, begin).trim();
+        }
+
+        String before = text.substring(0, begin);
+        String after = text.substring(end + AUTOWG_END.length());
+        return (before + after).trim();
+    }
+
+    private static String mergeCustomProxyListWithAutoWireguard(String customProxyList) {
+        String base = stripAutoWireguardBlock(customProxyList);
+
+        List<String> auto = discoverWireguardSmartProxyEntries();
+        if (auto.isEmpty()) {
+            return base == null ? "" : base;
+        }
+
+        String baseSafe = base == null ? "" : base;
+        List<String> existing = baseSafe.trim().isEmpty()
+                ? Collections.emptyList()
+                : Arrays.stream(baseSafe.split("\\r?\\n"))
+                        .map(s -> s == null ? "" : s.trim())
+                        .filter(s -> !s.isEmpty())
+                        .collect(Collectors.toList());
+
+        StringBuilder sb = new StringBuilder();
+        if (!baseSafe.trim().isEmpty()) {
+            sb.append(baseSafe.trim());
+            sb.append("\n\n");
+        }
+
+        sb.append(AUTOWG_BEGIN).append("\n");
+        for (String entry : auto) {
+            if (!existing.contains(entry)) {
+                sb.append(entry).append("\n");
+            }
+        }
+        sb.append(AUTOWG_END);
+
+        return sb.toString();
+    }
+
     private void cancel_buttonActionPerformed(java.awt.event.ActionEvent evt) {//GEN-FIRST:event_cancel_buttonActionPerformed
 
         if (!this.save_button.isEnabled()) {
@@ -2133,12 +2222,12 @@ public class SettingsDialog extends javax.swing.JDialog {
                 createUploadLogDir();
             }
 
-            if (custom_proxy_textarea.getText().trim().length() == 0) {
+            if (stripAutoWireguardBlock(custom_proxy_textarea.getText()).trim().length() == 0) {
                 smart_proxy_checkbox.setSelected(false);
             }
 
             settings.put("smart_proxy", smart_proxy_checkbox.isSelected() ? "yes" : "no");
-            settings.put("custom_proxy_list", custom_proxy_textarea.getText());
+            settings.put("custom_proxy_list", stripAutoWireguardBlock(custom_proxy_textarea.getText()));
 
             String old_font = DBTools.selectSettingValue("font");
 
