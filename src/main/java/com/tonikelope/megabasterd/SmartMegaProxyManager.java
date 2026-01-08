@@ -269,17 +269,61 @@ public final class SmartMegaProxyManager {
         return s == null ? "" : s.replace("\\", "\\\\").replace("\"", "\\\"");
     }
 
-    private static int runCommand(List<String> cmd, int timeoutMs) throws IOException, InterruptedException {
+    private static final class CommandResult {
+        public final int exitCode;
+        public final String output;
+
+        private CommandResult(int exitCode, String output) {
+            this.exitCode = exitCode;
+            this.output = output;
+        }
+    }
+
+    private static CommandResult runCommand(List<String> cmd, int timeoutMs) throws IOException, InterruptedException {
         ProcessBuilder pb = new ProcessBuilder(cmd);
         pb.redirectErrorStream(true);
         Process p = pb.start();
 
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        Thread reader = new Thread(() -> {
+            try (InputStream is = p.getInputStream()) {
+                byte[] buf = new byte[4096];
+                int n;
+                while ((n = is.read(buf)) != -1) {
+                    out.write(buf, 0, n);
+                }
+            } catch (IOException ignored) {
+            }
+        }, "SmartProxy-ipsec-reader");
+        reader.setDaemon(true);
+        reader.start();
+
         boolean done = p.waitFor(timeoutMs, TimeUnit.MILLISECONDS);
         if (!done) {
             p.destroyForcibly();
-            return 124;
         }
-        return p.exitValue();
+
+        try {
+            reader.join(1000);
+        } catch (InterruptedException ignored) {
+        }
+
+        String output = out.toString(StandardCharsets.UTF_8);
+
+        if (!done) {
+            return new CommandResult(124, output);
+        }
+        return new CommandResult(p.exitValue(), output);
+    }
+
+    private static String limitLog(String s, int maxChars) {
+        if (s == null) {
+            return "";
+        }
+        if (s.length() <= maxChars) {
+            return s;
+        }
+        return s.substring(0, maxChars) + "\n...[truncated]";
     }
 
     public boolean ensureIkev2Connected(String ikev2Key) {
@@ -341,15 +385,21 @@ public final class SmartMegaProxyManager {
                 } catch (Exception ignored) {
                 }
 
-                int startExit = runCommand(Arrays.asList("ipsec", "start"), 20_000);
-                if (startExit != 0) {
-                    LOG.log(Level.WARNING, "[Smart Proxy] IKEv2: failed to start strongSwan (exit={0})", startExit);
+                CommandResult startRes = runCommand(Arrays.asList("ipsec", "start"), 20_000);
+                if (startRes.exitCode != 0) {
+                    LOG.log(Level.WARNING, "[Smart Proxy] IKEv2: failed to start strongSwan (exit={0})\n{1}", new Object[]{startRes.exitCode, limitLog(startRes.output, 8000)});
                     return false;
                 }
 
-                int upExit = runCommand(Arrays.asList("ipsec", "up", connName), Math.max(30_000, _proxy_timeout));
-                if (upExit != 0) {
-                    LOG.log(Level.WARNING, "[Smart Proxy] IKEv2: failed to bring up tunnel (exit={0})", upExit);
+                CommandResult upRes = runCommand(Arrays.asList("ipsec", "up", connName), Math.max(30_000, _proxy_timeout));
+                if (upRes.exitCode != 0) {
+                    String extra = "";
+                    try {
+                        CommandResult statusRes = runCommand(Arrays.asList("ipsec", "statusall"), 10_000);
+                        extra = "\n[ipsec statusall]\n" + limitLog(statusRes.output, 8000);
+                    } catch (Exception ignored) {
+                    }
+                    LOG.log(Level.WARNING, "[Smart Proxy] IKEv2: failed to bring up tunnel (exit={0})\n{1}{2}", new Object[]{upRes.exitCode, limitLog(upRes.output, 8000), extra});
                     return false;
                 }
 
