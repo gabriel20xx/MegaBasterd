@@ -283,6 +283,14 @@ public final class SmartMegaProxyManager {
         return "megabasterd_ikev2_" + Long.toHexString(crc.getValue());
     }
 
+    // WireGuard interface names are limited to 15 chars.
+    // Generate a stable, compliant interface name from the SmartProxy key.
+    private static String safeWireguardInterfaceFromKey(String key) {
+        CRC32 crc = new CRC32();
+        crc.update(key.getBytes(StandardCharsets.UTF_8));
+        return "wg" + Long.toHexString(crc.getValue());
+    }
+
     private static String escapeStrongSwanString(String s) {
         return s == null ? "" : s.replace("\\", "\\\\").replace("\"", "\\\"");
     }
@@ -553,8 +561,12 @@ public final class SmartMegaProxyManager {
             disconnectActiveWireguard();
 
             try {
-                // Best-effort: bring up config.
-                CommandResult upRes = runCommand(Arrays.asList("wg-quick", "up", cfg.path), Math.max(30_000, _proxy_timeout));
+                if (!installWireguardConfig(cfg)) {
+                    return false;
+                }
+
+                // Bring up by interface name (expects /etc/wireguard/<iface>.conf).
+                CommandResult upRes = runCommand(Arrays.asList("wg-quick", "up", cfg.iface), Math.max(30_000, _proxy_timeout));
                 if (upRes.exitCode != 0) {
                     String extra = "";
                     try {
@@ -567,8 +579,8 @@ public final class SmartMegaProxyManager {
                 }
 
                 _active_wireguard_key = wgKey;
-                _active_wireguard_conf = cfg.path;
-                LOG.log(Level.INFO, "[Smart Proxy] WireGuard tunnel up: {0} -> {1}", new Object[]{wgKey, cfg.path});
+                _active_wireguard_conf = cfg.iface;
+                LOG.log(Level.INFO, "[Smart Proxy] WireGuard tunnel up: {0} -> {1}", new Object[]{wgKey, cfg.installedPath});
                 return true;
 
             } catch (Exception ex) {
@@ -938,11 +950,41 @@ public final class SmartMegaProxyManager {
     public static final class WireguardConfig {
 
         public final String name;
-        public final String path;
+        public final String sourcePath;
+        public final String iface;
+        public final String installedPath;
 
-        public WireguardConfig(String name, String path) {
+        public WireguardConfig(String name, String sourcePath, String iface, String installedPath) {
             this.name = name;
-            this.path = path;
+            this.sourcePath = sourcePath;
+            this.iface = iface;
+            this.installedPath = installedPath;
+        }
+    }
+
+    private static boolean installWireguardConfig(WireguardConfig cfg) {
+        if (cfg == null) {
+            return false;
+        }
+
+        try {
+            Path src = Paths.get(cfg.sourcePath);
+            Path dst = Paths.get(cfg.installedPath);
+            Files.createDirectories(dst.getParent());
+
+            // Always overwrite to pick up changes.
+            Files.copy(src, dst, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+
+            try {
+                Files.setPosixFilePermissions(dst, java.nio.file.attribute.PosixFilePermissions.fromString("rw-------"));
+            } catch (Exception ignored) {
+                // Best-effort.
+            }
+
+            return true;
+        } catch (Exception ex) {
+            LOG.log(Level.WARNING, "[Smart Proxy] WireGuard: failed to install config {0} -> {1}: {2}", new Object[]{cfg.sourcePath, cfg.installedPath, ex.getMessage()});
+            return false;
         }
     }
 
@@ -972,8 +1014,10 @@ public final class SmartMegaProxyManager {
                     continue;
                 }
                 String key = "wireguard://" + name;
+                String iface = safeWireguardInterfaceFromKey(key);
+                String installed = "/etc/wireguard/" + iface + ".conf";
                 target.put(key, new Long[]{-1L, 3L});
-                WIREGUARD_CONFIGS.put(key, new WireguardConfig(name, p.toString()));
+                WIREGUARD_CONFIGS.put(key, new WireguardConfig(name, p.toString(), iface, installed));
             }
 
         } catch (Exception ex) {
