@@ -2222,12 +2222,18 @@ public class SettingsDialog extends javax.swing.JDialog {
                 createUploadLogDir();
             }
 
-            if (stripAutoWireguardBlock(custom_proxy_textarea.getText()).trim().length() == 0) {
+            String savedCustomList = stripAutoWireguardBlock(custom_proxy_textarea.getText());
+            boolean hasCustomEntries = savedCustomList != null && savedCustomList.trim().length() > 0;
+            boolean hasAutoWireguardEntries = !discoverWireguardSmartProxyEntries().isEmpty();
+
+            // SmartProxy should be usable with only auto-discovered /wireguard configs.
+            // Only force-disable it when there are no custom entries AND no auto entries.
+            if (!hasCustomEntries && !hasAutoWireguardEntries) {
                 smart_proxy_checkbox.setSelected(false);
             }
 
             settings.put("smart_proxy", smart_proxy_checkbox.isSelected() ? "yes" : "no");
-            settings.put("custom_proxy_list", stripAutoWireguardBlock(custom_proxy_textarea.getText()));
+            settings.put("custom_proxy_list", savedCustomList);
 
             String old_font = DBTools.selectSettingValue("font");
 
