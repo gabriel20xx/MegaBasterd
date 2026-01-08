@@ -53,7 +53,41 @@ Downloads and app configuration are persisted under:
 The Docker setup supports using **IKEv2 (IPsec) VPN tunnels** as SmartProxy entries.
 
 - Compose must grant the container `NET_ADMIN` (and usually `NET_RAW`).
+- If you run with `docker run` (not compose), you must also add these capabilities.
 - Add IKEv2 lines to the SmartProxy custom list using:
 	- `ikev2://username:password@hostname`
+	- If your password contains `@` or `:`, use the alternate format:
+		- `ikev2:hostname@BASE64(username):BASE64(password)`
 
 MegaBasterd will establish the tunnel (via **strongSwan**) when that entry is selected.
+
+### SmartProxy + WireGuard (inside Docker)
+
+The Docker setup also supports using **WireGuard** tunnels as SmartProxy entries.
+
+- Put your WireGuard configs under `./docker-data/wireguard` (mounted into the container as `/wireguard`).
+- Any `*.conf` file in `/wireguard` is automatically added to the SmartProxy pool as:
+	- `wireguard://<filename-without-.conf>`
+- Compose must grant the container `NET_ADMIN` and access to `/dev/net/tun`.
+
+Troubleshooting commands:
+	- `docker exec megabasterd wg show`
+	- `docker exec megabasterd ip route`
+
+#### Running without compose (example)
+
+```bash
+docker run --name megabasterd --rm \
+  -p 6080:6080 \
+  --cap-add=NET_ADMIN --cap-add=NET_RAW \
+  -v "./docker-data/config:/config" \
+  -v "./docker-data/downloads:/downloads" \
+  megabasterd
+```
+
+#### Troubleshooting
+
+- If the tunnel fails to connect, strongSwan/charon logs are written to `/var/log/charon.log` inside the container.
+- Useful commands:
+	- `docker exec megabasterd ipsec statusall`
+	- `docker exec megabasterd tail -n 200 /var/log/charon.log`

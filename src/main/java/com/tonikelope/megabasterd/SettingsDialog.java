@@ -622,7 +622,7 @@ public class SettingsDialog extends javax.swing.JDialog {
             megacrypter_reverse_port_spinner.setEnabled(use_mc_reverse);
             megacrypter_reverse_warning_label.setEnabled(use_mc_reverse);
 
-            boolean use_smart_proxy = false;
+            boolean use_smart_proxy = MainPanel.DEFAULT_SMART_PROXY;
 
             String smart_proxy = DBTools.selectSettingValue("smart_proxy");
 
@@ -3331,6 +3331,17 @@ public class SettingsDialog extends javax.swing.JDialog {
     private void smart_proxy_checkboxStateChanged(javax.swing.event.ChangeEvent evt) {//GEN-FIRST:event_smart_proxy_checkboxStateChanged
 
         MiscTools.containerSetEnabled(smart_proxy_settings, smart_proxy_checkbox.isSelected());
+
+        // Allow editing the SmartProxy list even when SmartProxy is disabled,
+        // so users can paste proxy/VPN entries before enabling it.
+        if (custom_proxy_textarea != null) {
+            custom_proxy_textarea.setEnabled(true);
+            custom_proxy_textarea.setEditable(true);
+        }
+        if (custom_proxy_list_label != null) {
+            custom_proxy_list_label.setEnabled(true);
+        }
+
         revalidate();
         repaint();
 

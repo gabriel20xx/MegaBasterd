@@ -5,9 +5,12 @@ services:
     cap_add:
       - NET_ADMIN
       - NET_RAW
+    devices:
+      - /dev/net/tun:/dev/net/tun
     ports:
       - "6080:6080"
     volumes:
       - ./docker-data/config:/config
       - ./docker-data/downloads:/downloads
+      - ./docker-data/wireguard:/wireguard
     restart: unless-stopped

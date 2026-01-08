@@ -221,8 +221,10 @@ public class ChunkDownloader implements Runnable, SecureSingleThreadNotifiable {
 
                     }
 
-                    while (_current_smart_proxy != null && "ikev2".equals(smart_proxy_protocol) && !proxy_manager.ensureIkev2Connected(_current_smart_proxy)) {
-                        proxy_manager.blockProxy(_current_smart_proxy, "IKEv2 connect failed");
+                    while (_current_smart_proxy != null
+                            && ("ikev2".equals(smart_proxy_protocol) || "wireguard".equals(smart_proxy_protocol))
+                            && !("ikev2".equals(smart_proxy_protocol) ? proxy_manager.ensureIkev2Connected(_current_smart_proxy) : proxy_manager.ensureWireguardConnected(_current_smart_proxy))) {
+                        proxy_manager.blockProxy(_current_smart_proxy, ("ikev2".equals(smart_proxy_protocol) ? "IKEv2" : "WireGuard") + " connect failed");
                         String[] next = proxy_manager.getProxy(_excluded_proxy_list);
                         if (next == null) {
                             _current_smart_proxy = null;
@@ -240,7 +242,7 @@ public class ChunkDownloader implements Runnable, SecureSingleThreadNotifiable {
 
                         URL url = new URL(chunk_url);
 
-                        if ("ikev2".equals(smart_proxy_protocol)) {
+                        if ("ikev2".equals(smart_proxy_protocol) || "wireguard".equals(smart_proxy_protocol)) {
                             con = (HttpURLConnection) url.openConnection();
                         } else {
                             String[] proxy_info = _current_smart_proxy.split(":");

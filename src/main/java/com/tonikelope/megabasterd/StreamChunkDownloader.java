@@ -74,8 +74,10 @@ public class StreamChunkDownloader implements Runnable {
 
                 smart_proxy_protocol = smart_proxy[1];
 
-                while (current_smart_proxy != null && "ikev2".equals(smart_proxy_protocol) && !proxy_manager.ensureIkev2Connected(current_smart_proxy)) {
-                    proxy_manager.blockProxy(current_smart_proxy, "IKEv2 connect failed");
+                while (current_smart_proxy != null
+                        && ("ikev2".equals(smart_proxy_protocol) || "wireguard".equals(smart_proxy_protocol))
+                        && !("ikev2".equals(smart_proxy_protocol) ? proxy_manager.ensureIkev2Connected(current_smart_proxy) : proxy_manager.ensureWireguardConnected(current_smart_proxy))) {
+                    proxy_manager.blockProxy(current_smart_proxy, ("ikev2".equals(smart_proxy_protocol) ? "IKEv2" : "WireGuard") + " connect failed");
                     String[] next = proxy_manager.getProxy(excluded_proxy_list);
                     if (next == null) {
                         current_smart_proxy = null;
@@ -130,8 +132,10 @@ public class StreamChunkDownloader implements Runnable {
 
                         }
 
-                        while (current_smart_proxy != null && "ikev2".equals(smart_proxy_protocol) && !proxy_manager.ensureIkev2Connected(current_smart_proxy)) {
-                            proxy_manager.blockProxy(current_smart_proxy, "IKEv2 connect failed");
+                        while (current_smart_proxy != null
+                                && ("ikev2".equals(smart_proxy_protocol) || "wireguard".equals(smart_proxy_protocol))
+                                && !("ikev2".equals(smart_proxy_protocol) ? proxy_manager.ensureIkev2Connected(current_smart_proxy) : proxy_manager.ensureWireguardConnected(current_smart_proxy))) {
+                            proxy_manager.blockProxy(current_smart_proxy, ("ikev2".equals(smart_proxy_protocol) ? "IKEv2" : "WireGuard") + " connect failed");
                             String[] next = proxy_manager.getProxy(excluded_proxy_list);
                             if (next == null) {
                                 current_smart_proxy = null;
@@ -144,7 +148,7 @@ public class StreamChunkDownloader implements Runnable {
                         if (current_smart_proxy != null) {
                             URL chunk_url = new URL(chunk_stream.getUrl());
 
-                            if ("ikev2".equals(smart_proxy_protocol)) {
+                            if ("ikev2".equals(smart_proxy_protocol) || "wireguard".equals(smart_proxy_protocol)) {
                                 con = (HttpURLConnection) chunk_url.openConnection();
                             } else {
                                 String[] proxy_info = current_smart_proxy.split(":");
@@ -175,7 +179,7 @@ public class StreamChunkDownloader implements Runnable {
 
                             if (current_smart_proxy != null) {
 
-                                if ("ikev2".equals(smart_proxy_protocol)) {
+                                if ("ikev2".equals(smart_proxy_protocol) || "wireguard".equals(smart_proxy_protocol)) {
                                     con = (HttpURLConnection) chunk_url.openConnection();
                                 } else {
                                     String[] proxy_info = current_smart_proxy.split(":");

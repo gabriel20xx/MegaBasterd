@@ -78,7 +78,7 @@ public final class MainPanel {
     public static final int DEFAULT_MEGA_PROXY_PORT = 9999;
     public static final int RUN_COMMAND_TIME = 120;
     public static final String DEFAULT_LANGUAGE = "EN";
-    public static final boolean DEFAULT_SMART_PROXY = false;
+    public static final boolean DEFAULT_SMART_PROXY = true;
     public static final double FORCE_GARBAGE_COLLECTION_MAX_MEMORY_PERCENT = 0.7;
     public static Font GUI_FONT = new JLabel().getFont();
     public static final float ZOOM_FACTOR = 0.8f;
@@ -355,6 +355,10 @@ public final class MainPanel {
                 Authenticator.setDefault(new SmartProxyAuthenticator());
 
                 String lista_proxy = DBTools.selectSettingValue("custom_proxy_list");
+
+                if (lista_proxy == null) {
+                    lista_proxy = "";
+                }
 
                 String url_list = MiscTools.findFirstRegex("^#(http.+)$", lista_proxy.trim(), 1);
 

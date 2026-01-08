@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-mkdir -p /config /downloads
+mkdir -p /config /downloads /wireguard
 
 # Make sure the default download directory (".") is persisted.
 # MegaBasterd uses "." as default when no default_down_dir is set.

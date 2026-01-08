@@ -55,6 +55,7 @@ public final class SmartMegaProxyManager {
     private final ConcurrentHashMap<String, Long[]> _proxy_list;
     private static final HashMap<String, String> PROXY_LIST_AUTH = new HashMap<>();
     private static final ConcurrentHashMap<String, Ikev2Credentials> IKEV2_AUTH = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, WireguardConfig> WIREGUARD_CONFIGS = new ConcurrentHashMap<>();
     private final MainPanel _main_panel;
     private volatile int _ban_time;
     private volatile int _proxy_timeout;
@@ -67,6 +68,9 @@ public final class SmartMegaProxyManager {
     private final Object _ikev2_lock = new Object();
     private volatile String _active_ikev2_key;
     private volatile String _active_ikev2_conn;
+
+    private volatile String _active_wireguard_key;
+    private volatile String _active_wireguard_conf;
 
     public boolean isRandom_select() {
         return _random_select;
@@ -198,9 +202,20 @@ public final class SmartMegaProxyManager {
 
             List<String> keysList = new ArrayList<>(keys);
 
-            // IKEv2 is a container-wide tunnel. If we already have one active and it is still usable,
+            // IKEv2 / WireGuard are container-wide tunnels. If we already have one active and it is still usable,
             // prefer sticking to it to avoid connect/disconnect thrashing across workers.
             Long current_time_pre = System.currentTimeMillis();
+            if (_active_wireguard_key != null) {
+                Long[] activeData = _proxy_list.get(_active_wireguard_key);
+                if (activeData != null
+                        && activeData.length >= 2
+                        && activeData[1] != null
+                        && activeData[1] == 3L
+                        && (activeData[0] == -1L || activeData[0] < current_time_pre - _ban_time * 1000)
+                        && (excluded == null || !excluded.contains(_active_wireguard_key))) {
+                    return new String[]{_active_wireguard_key, protoFromFlag(activeData[1])};
+                }
+            }
             if (_active_ikev2_key != null) {
                 Long[] activeData = _proxy_list.get(_active_ikev2_key);
                 if (activeData != null
@@ -250,6 +265,9 @@ public final class SmartMegaProxyManager {
         }
         if (protoFlag == 2L) {
             return "ikev2";
+        }
+        if (protoFlag == 3L) {
+            return "wireguard";
         }
         return "http";
     }
@@ -326,6 +344,24 @@ public final class SmartMegaProxyManager {
         return s.substring(0, maxChars) + "\n...[truncated]";
     }
 
+    private static String tailFile(Path file, int maxBytes) {
+        try {
+            if (file == null || !Files.exists(file)) {
+                return "";
+            }
+            long size = Files.size(file);
+            if (size <= 0) {
+                return "";
+            }
+            int toRead = (int) Math.min((long) maxBytes, size);
+            byte[] all = Files.readAllBytes(file);
+            int start = Math.max(0, all.length - toRead);
+            return new String(Arrays.copyOfRange(all, start, all.length), StandardCharsets.UTF_8);
+        } catch (Exception ignored) {
+            return "";
+        }
+    }
+
     public boolean ensureIkev2Connected(String ikev2Key) {
         if (ikev2Key == null) {
             return false;
@@ -346,6 +382,8 @@ public final class SmartMegaProxyManager {
                 return true;
             }
 
+            // Ensure only one tunnel type is active at a time.
+            disconnectActiveWireguard();
             disconnectActiveIkev2();
 
             String connName = safeConnNameFromKey(ikev2Key);
@@ -353,6 +391,45 @@ public final class SmartMegaProxyManager {
             try {
                 Path ipsecConf = Paths.get("/etc/ipsec.conf");
                 Path ipsecSecrets = Paths.get("/etc/ipsec.secrets");
+                // In containers there is usually no syslog/journald, so charon logs would otherwise disappear.
+                // Force file logging so we can surface meaningful diagnostics back to the UI.
+                // We write to a dedicated include file to avoid clobbering the distro-provided template.
+                Path charonLogging = Paths.get("/etc/strongswan.d/99-megabasterd-logging.conf");
+                Path charonLogFile = Paths.get("/var/log/charon.log");
+
+                try {
+                    Files.createDirectories(charonLogFile.getParent());
+                } catch (Exception ignored) {
+                }
+
+                try {
+                    if (!Files.exists(charonLogFile)) {
+                        Files.write(charonLogFile, "".getBytes(StandardCharsets.UTF_8));
+                    }
+                    try {
+                        java.nio.file.attribute.PosixFilePermissions.fromString("rw-rw-rw-");
+                        Files.setPosixFilePermissions(charonLogFile, java.nio.file.attribute.PosixFilePermissions.fromString("rw-rw-rw-"));
+                    } catch (Exception ignored) {
+                        // Best-effort; on some filesystems Posix permissions may not be supported.
+                    }
+                } catch (Exception ex) {
+                    LOG.log(Level.WARNING, "[Smart Proxy] IKEv2: unable to prepare charon log file {0}: {1}", new Object[]{charonLogFile.toString(), ex.getMessage()});
+                }
+
+                StringBuilder loggingConf = new StringBuilder();
+                loggingConf.append("charon {\n");
+                loggingConf.append("  filelog {\n");
+                loggingConf.append("    /var/log/charon.log {\n");
+                loggingConf.append("      time_format = %b %e %T\n");
+                loggingConf.append("      append = no\n");
+                loggingConf.append("      flush_line = yes\n");
+                loggingConf.append("      default = 2\n");
+                loggingConf.append("      ike = 2\n");
+                loggingConf.append("      knl = 2\n");
+                loggingConf.append("      cfg = 2\n");
+                loggingConf.append("    }\n");
+                loggingConf.append("  }\n");
+                loggingConf.append("}\n");
 
                 StringBuilder conf = new StringBuilder();
                 conf.append("config setup\n");
@@ -376,6 +453,12 @@ public final class SmartMegaProxyManager {
 
                 String secrets = "\"" + escapeStrongSwanString(creds.username) + "\" : EAP \"" + escapeStrongSwanString(creds.password) + "\"\n";
 
+                try {
+                    Files.write(charonLogging, loggingConf.toString().getBytes(StandardCharsets.UTF_8));
+                } catch (Exception ex) {
+                    LOG.log(Level.WARNING, "[Smart Proxy] IKEv2: unable to write strongSwan logging config {0}: {1}", new Object[]{charonLogging.toString(), ex.getMessage()});
+                }
+
                 Files.write(ipsecConf, conf.toString().getBytes(StandardCharsets.UTF_8));
                 Files.write(ipsecSecrets, secrets.getBytes(StandardCharsets.UTF_8));
 
@@ -396,10 +479,18 @@ public final class SmartMegaProxyManager {
                     String extra = "";
                     try {
                         CommandResult statusRes = runCommand(Arrays.asList("ipsec", "statusall"), 10_000);
-                        extra = "\n[ipsec statusall]\n" + limitLog(statusRes.output, 8000);
+                        extra = "\n[ipsec statusall exit=" + String.valueOf(statusRes.exitCode) + "]\n" + limitLog(statusRes.output, 8000);
                     } catch (Exception ignored) {
                     }
-                    LOG.log(Level.WARNING, "[Smart Proxy] IKEv2: failed to bring up tunnel (exit={0})\n{1}{2}", new Object[]{upRes.exitCode, limitLog(upRes.output, 8000), extra});
+
+                    String charonTail = tailFile(charonLogFile, 32 * 1024);
+                    if (charonTail != null && !charonTail.trim().isEmpty()) {
+                        charonTail = "\n[/var/log/charon.log tail]\n" + limitLog(charonTail, 8000);
+                    } else {
+                        charonTail = "\n[/var/log/charon.log tail]\n" + "(empty or missing)";
+                    }
+
+                    LOG.log(Level.WARNING, "[Smart Proxy] IKEv2: failed to bring up tunnel (exit={0})\n{1}{2}{3}", new Object[]{upRes.exitCode, limitLog(upRes.output, 8000), extra, charonTail});
                     return false;
                 }
 
@@ -436,6 +527,74 @@ public final class SmartMegaProxyManager {
         }
     }
 
+    public boolean ensureWireguardConnected(String wgKey) {
+        if (wgKey == null) {
+            return false;
+        }
+
+        WireguardConfig cfg = WIREGUARD_CONFIGS.get(wgKey);
+        if (cfg == null) {
+            LOG.log(Level.WARNING, "[Smart Proxy] WireGuard config not found for key: {0}", wgKey);
+            return false;
+        }
+
+        if (!isLinux()) {
+            LOG.log(Level.WARNING, "[Smart Proxy] WireGuard is only supported on Linux containers.");
+            return false;
+        }
+
+        synchronized (_ikev2_lock) {
+            if (wgKey.equals(_active_wireguard_key)) {
+                return true;
+            }
+
+            // Ensure only one tunnel type is active at a time.
+            disconnectActiveIkev2();
+            disconnectActiveWireguard();
+
+            try {
+                // Best-effort: bring up config.
+                CommandResult upRes = runCommand(Arrays.asList("wg-quick", "up", cfg.path), Math.max(30_000, _proxy_timeout));
+                if (upRes.exitCode != 0) {
+                    String extra = "";
+                    try {
+                        CommandResult wgShow = runCommand(Arrays.asList("wg", "show"), 10_000);
+                        extra = "\n[wg show exit=" + String.valueOf(wgShow.exitCode) + "]\n" + limitLog(wgShow.output, 8000);
+                    } catch (Exception ignored) {
+                    }
+                    LOG.log(Level.WARNING, "[Smart Proxy] WireGuard: failed to bring up tunnel (exit={0})\n{1}{2}", new Object[]{upRes.exitCode, limitLog(upRes.output, 8000), extra});
+                    return false;
+                }
+
+                _active_wireguard_key = wgKey;
+                _active_wireguard_conf = cfg.path;
+                LOG.log(Level.INFO, "[Smart Proxy] WireGuard tunnel up: {0} -> {1}", new Object[]{wgKey, cfg.path});
+                return true;
+
+            } catch (Exception ex) {
+                LOG.log(Level.SEVERE, "[Smart Proxy] WireGuard error: {0}", ex.getMessage());
+                return false;
+            }
+        }
+    }
+
+    private void disconnectActiveWireguard() {
+        synchronized (_ikev2_lock) {
+            if (_active_wireguard_conf == null || _active_wireguard_conf.isEmpty()) {
+                _active_wireguard_key = null;
+                _active_wireguard_conf = null;
+                return;
+            }
+            try {
+                runCommand(Arrays.asList("wg-quick", "down", _active_wireguard_conf), 20_000);
+            } catch (Exception ignored) {
+            }
+            LOG.log(Level.INFO, "[Smart Proxy] WireGuard tunnel down: {0}", _active_wireguard_conf);
+            _active_wireguard_key = null;
+            _active_wireguard_conf = null;
+        }
+    }
+
     public synchronized void blockProxy(String proxy, String cause) {
 
         if (_proxy_list.containsKey(proxy)) {
@@ -461,6 +620,11 @@ public final class SmartMegaProxyManager {
             // If the blocked entry is the currently active IKEv2 tunnel, tear it down.
             if (proxy != null && proxy.equals(_active_ikev2_key)) {
                 disconnectActiveIkev2();
+            }
+
+            // If the blocked entry is the currently active WireGuard tunnel, tear it down.
+            if (proxy != null && proxy.equals(_active_wireguard_key)) {
+                disconnectActiveWireguard();
             }
 
             _main_panel.getView().updateSmartProxyStatus("SmartProxy: ON (" + String.valueOf(getProxyCount() - countBlockedProxies()) + ")" + (this.isForce_smart_proxy() ? " F!" : ""));
@@ -490,6 +654,7 @@ public final class SmartMegaProxyManager {
 
             // Rebuild credential maps from scratch on every refresh.
             IKEV2_AUTH.clear();
+            WIREGUARD_CONFIGS.clear();
 
             String custom_proxy_list = (_proxy_list_url == null ? DBTools.selectSettingValue("custom_proxy_list") : null);
 
@@ -567,6 +732,9 @@ public final class SmartMegaProxyManager {
                     }
                 }
 
+                // Auto-load WireGuard configs from /wireguard (Docker volume)
+                loadWireguardConfigs(custom_clean_list);
+
                 if (!custom_clean_list.isEmpty()) {
 
                     _proxy_list.clear();
@@ -581,6 +749,15 @@ public final class SmartMegaProxyManager {
                     PROXY_LIST_AUTH.putAll(custom_clean_list_auth);
                 }
 
+            }
+
+            // If the user provided no custom list (or it was empty), we still want to surface /wireguard configs.
+            if (custom_proxy_list == null) {
+                loadWireguardConfigs(custom_clean_list);
+                if (!custom_clean_list.isEmpty()) {
+                    _proxy_list.clear();
+                    _proxy_list.putAll(custom_clean_list);
+                }
             }
 
             if (custom_clean_list.isEmpty() && _proxy_list_url != null && !"".equals(_proxy_list_url)) {
@@ -674,6 +851,9 @@ public final class SmartMegaProxyManager {
 
                     }
 
+                    // Auto-load WireGuard configs from /wireguard (Docker volume)
+                    loadWireguardConfigs(url_clean_list);
+
                     _proxy_list.clear();
 
                     _proxy_list.putAll(url_clean_list);
@@ -752,6 +932,52 @@ public final class SmartMegaProxyManager {
             this.hostname = hostname;
             this.username = username;
             this.password = password;
+        }
+    }
+
+    public static final class WireguardConfig {
+
+        public final String name;
+        public final String path;
+
+        public WireguardConfig(String name, String path) {
+            this.name = name;
+            this.path = path;
+        }
+    }
+
+    private static void loadWireguardConfigs(LinkedHashMap<String, Long[]> target) {
+        if (!isLinux() || target == null) {
+            return;
+        }
+        try {
+            Path dir = Paths.get("/wireguard");
+            if (!Files.isDirectory(dir)) {
+                return;
+            }
+
+            List<Path> confs = new ArrayList<>();
+            try (java.util.stream.Stream<Path> s = Files.list(dir)) {
+                s.filter(p -> Files.isRegularFile(p))
+                        .filter(p -> p.getFileName() != null && p.getFileName().toString().toLowerCase().endsWith(".conf"))
+                        .forEach(confs::add);
+            }
+
+            confs.sort((a, b) -> a.getFileName().toString().compareToIgnoreCase(b.getFileName().toString()));
+
+            for (Path p : confs) {
+                String fn = p.getFileName().toString();
+                String name = fn.substring(0, fn.length() - ".conf".length());
+                if (name.trim().isEmpty()) {
+                    continue;
+                }
+                String key = "wireguard://" + name;
+                target.put(key, new Long[]{-1L, 3L});
+                WIREGUARD_CONFIGS.put(key, new WireguardConfig(name, p.toString()));
+            }
+
+        } catch (Exception ex) {
+            LOG.log(Level.WARNING, "[Smart Proxy] WireGuard: failed to load /wireguard configs: {0}", ex.getMessage());
         }
     }
 

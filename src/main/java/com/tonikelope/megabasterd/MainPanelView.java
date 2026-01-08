@@ -1382,11 +1382,19 @@ public final class MainPanelView extends javax.swing.JFrame {
 
                         String lista_proxy = DBTools.selectSettingValue("custom_proxy_list");
 
+                        if (lista_proxy == null) {
+                            lista_proxy = "";
+                        }
+
                         String url_list = MiscTools.findFirstRegex("^#(http.+)$", lista_proxy.trim(), 1);
 
                         MainPanel.setProxy_manager(new SmartMegaProxyManager(url_list, _main_panel));
                     } else {
                         String lista_proxy = DBTools.selectSettingValue("custom_proxy_list");
+
+                        if (lista_proxy == null) {
+                            lista_proxy = "";
+                        }
                         String url_list = MiscTools.findFirstRegex("^#(http.+)$", lista_proxy.trim(), 1);
                         MainPanel.getProxy_manager().refreshProxyList(url_list);
                     }

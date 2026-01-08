@@ -16,9 +16,11 @@ RUN apt-get update \
         ca-certificates \
         fluxbox \
         iproute2 \
+        iptables \
         novnc \
         strongswan \
         libcharon-extra-plugins \
+        wireguard-tools \
         websockify \
         x11vnc \
         xvfb \
@@ -35,7 +37,7 @@ COPY --from=build /build/target/*jar-with-dependencies.jar /app/megabasterd.jar
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-VOLUME ["/config", "/downloads"]
+VOLUME ["/config", "/downloads", "/wireguard"]
 
 EXPOSE 6080
 
