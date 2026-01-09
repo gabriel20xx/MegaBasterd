@@ -24,6 +24,7 @@ RUN apt-get update \
         wireguard-tools \
         websockify \
         x11vnc \
+        x11-utils \
         xvfb \
     && rm -rf /var/lib/apt/lists/*
 
