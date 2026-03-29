@@ -1122,9 +1122,14 @@ public class MegaAPI implements Serializable {
             }
         }
 
+        if (res == null) {
+            LOG.log(Level.WARNING, "MEGA FOLDER {0} returned null response", folder_id);
+            return null;
+        }
+
         LOG.log(Level.INFO, "MEGA FOLDER {0} JSON FILE TREE SIZE -> {1}", new Object[]{folder_id, MiscTools.formatBytes((long) res.length())});
 
-        if (res != null) {
+        {
 
             ObjectMapper objectMapper = new ObjectMapper();
 
@@ -1208,9 +1213,6 @@ public class MegaAPI implements Serializable {
 
             }
 
-        } else {
-
-            throw new Exception();
         }
 
         return folder_nodes;
@@ -1290,9 +1292,14 @@ public class MegaAPI implements Serializable {
             }
         }
 
+        if (res == null) {
+            LOG.log(Level.WARNING, "MEGA FOLDER {0} returned null response", folder_id);
+            return nlinks;
+        }
+
         LOG.log(Level.INFO, "MEGA FOLDER {0} JSON FILE TREE SIZE -> {1}", new Object[]{folder_id, MiscTools.formatBytes((long) res.length())});
 
-        if (res != null) {
+        {
 
             ObjectMapper objectMapper = new ObjectMapper();
 
@@ -1327,9 +1334,6 @@ public class MegaAPI implements Serializable {
 
             }
 
-        } else {
-
-            throw new Exception();
         }
 
         return nlinks;

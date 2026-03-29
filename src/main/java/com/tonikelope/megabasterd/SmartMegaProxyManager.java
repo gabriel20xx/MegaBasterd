@@ -556,6 +556,13 @@ public final class SmartMegaProxyManager {
                 return true;
             }
 
+            // If the calling thread is already interrupted (e.g. download pool shutting down), bail out
+            // immediately instead of attempting tunnel operations that will fail with InterruptedException.
+            if (Thread.currentThread().isInterrupted()) {
+                LOG.log(Level.INFO, "[Smart Proxy] WireGuard: skipping connect for {0} (thread interrupted)", wgKey);
+                return false;
+            }
+
             // Ensure only one tunnel type is active at a time.
             disconnectActiveIkev2();
             disconnectActiveWireguard();
@@ -567,6 +574,17 @@ public final class SmartMegaProxyManager {
 
                 // Bring up by interface name (expects /etc/wireguard/<iface>.conf).
                 CommandResult upRes = runCommand(Arrays.asList("wg-quick", "up", cfg.iface), Math.max(30_000, _proxy_timeout));
+
+                // If the interface already exists (stale leftover), tear it down and retry once.
+                if (upRes.exitCode != 0 && upRes.output != null && upRes.output.contains("already exists")) {
+                    LOG.log(Level.INFO, "[Smart Proxy] WireGuard: interface {0} already exists, tearing down and retrying", cfg.iface);
+                    try {
+                        runCommand(Arrays.asList("wg-quick", "down", cfg.iface), 15_000);
+                    } catch (Exception ignored) {
+                    }
+                    upRes = runCommand(Arrays.asList("wg-quick", "up", cfg.iface), Math.max(30_000, _proxy_timeout));
+                }
+
                 if (upRes.exitCode != 0) {
                     String extra = "";
                     try {
@@ -583,8 +601,12 @@ public final class SmartMegaProxyManager {
                 LOG.log(Level.INFO, "[Smart Proxy] WireGuard tunnel up: {0} -> {1}", new Object[]{wgKey, cfg.installedPath});
                 return true;
 
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+                LOG.log(Level.INFO, "[Smart Proxy] WireGuard: connect interrupted for {0} (thread shutting down)", wgKey);
+                return false;
             } catch (Exception ex) {
-                LOG.log(Level.SEVERE, "[Smart Proxy] WireGuard error: {0}", ex.getMessage());
+                LOG.log(Level.SEVERE, "[Smart Proxy] WireGuard error ({0}): {1}", new Object[]{ex.getClass().getSimpleName(), ex.getMessage()});
                 return false;
             }
         }
@@ -592,18 +614,38 @@ public final class SmartMegaProxyManager {
 
     private void disconnectActiveWireguard() {
         synchronized (_ikev2_lock) {
-            if (_active_wireguard_conf == null || _active_wireguard_conf.isEmpty()) {
-                _active_wireguard_key = null;
-                _active_wireguard_conf = null;
-                return;
+            // Tear down the tracked interface first.
+            if (_active_wireguard_conf != null && !_active_wireguard_conf.isEmpty()) {
+                try {
+                    runCommand(Arrays.asList("wg-quick", "down", _active_wireguard_conf), 20_000);
+                } catch (Exception ignored) {
+                }
+                LOG.log(Level.INFO, "[Smart Proxy] WireGuard tunnel down: {0}", _active_wireguard_conf);
             }
-            try {
-                runCommand(Arrays.asList("wg-quick", "down", _active_wireguard_conf), 20_000);
-            } catch (Exception ignored) {
-            }
-            LOG.log(Level.INFO, "[Smart Proxy] WireGuard tunnel down: {0}", _active_wireguard_conf);
             _active_wireguard_key = null;
             _active_wireguard_conf = null;
+
+            // Clean up ALL stale wg* interfaces to prevent accumulation.
+            tearDownAllWireguardInterfaces();
+        }
+    }
+
+    private void tearDownAllWireguardInterfaces() {
+        try {
+            CommandResult wgShow = runCommand(Arrays.asList("wg", "show", "interfaces"), 10_000);
+            if (wgShow.exitCode == 0 && wgShow.output != null && !wgShow.output.trim().isEmpty()) {
+                for (String iface : wgShow.output.trim().split("\\s+")) {
+                    iface = iface.trim();
+                    if (!iface.isEmpty()) {
+                        try {
+                            runCommand(Arrays.asList("wg-quick", "down", iface), 15_000);
+                            LOG.log(Level.INFO, "[Smart Proxy] WireGuard: cleaned up stale interface {0}", iface);
+                        } catch (Exception ignored) {
+                        }
+                    }
+                }
+            }
+        } catch (Exception ignored) {
         }
     }
 

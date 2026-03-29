@@ -464,6 +464,12 @@ public class FolderLinkDialog extends javax.swing.JDialog {
 
             folder_nodes = ma.getFolderNodes(folder_id, folder_key, node_bar, (r == 0));
 
+            if (folder_nodes == null) {
+                LOG.log(Level.WARNING, "Folder nodes returned null for {0}", folder_id);
+                _mega_error = 2;
+                return -1;
+            }
+
             MegaMutableTreeNode root = null;
 
             final int nodos_totales = folder_nodes.size();
