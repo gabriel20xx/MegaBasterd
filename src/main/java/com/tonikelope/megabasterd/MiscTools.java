@@ -74,6 +74,7 @@ import java.util.Enumeration;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.HexFormat;
 import java.util.Random;
 import java.util.concurrent.Callable;
 import java.util.concurrent.FutureTask;
@@ -108,8 +109,6 @@ import javax.swing.tree.DefaultTreeModel;
 import javax.swing.tree.MutableTreeNode;
 import javax.swing.tree.TreeNode;
 import javax.swing.tree.TreePath;
-import javax.xml.bind.DatatypeConverter;
-import javax.xml.bind.annotation.adapters.HexBinaryAdapter;
 
 /**
  *
@@ -157,7 +156,7 @@ public class MiscTools {
                     digest.update(buffer, 0, n);
                 }
             }
-            return new HexBinaryAdapter().marshal(digest.digest()).toLowerCase().trim();
+            return HexFormat.of().formatHex(digest.digest());
         } catch (NoSuchAlgorithmException ex) {
             Logger.getLogger(MiscTools.class.getName()).log(Level.SEVERE, null, ex);
         }
@@ -682,7 +681,7 @@ public class MiscTools {
     }
 
     public static byte[] hex2bin(String s) {
-        return DatatypeConverter.parseHexBinary(s);
+        return HexFormat.of().parseHex(s);
     }
 
     public static void copyTextToClipboard(String text) {
