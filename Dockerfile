@@ -14,6 +14,7 @@ FROM eclipse-temurin:17-jre-jammy
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
+        feh \
         fluxbox \
         iproute2 \
         iptables \
