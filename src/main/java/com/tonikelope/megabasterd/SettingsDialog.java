@@ -425,6 +425,9 @@ public class SettingsDialog extends javax.swing.JDialog {
 
             verify_file_down_checkbox.setSelected(cbc_mac);
 
+            String overwrite_existing = DBTools.selectSettingValue("overwrite_existing_files");
+            overwrite_existing_files_checkbox.setSelected("yes".equals(overwrite_existing));
+
             boolean use_slots = Download.USE_SLOTS_DEFAULT;
 
             String use_slots_val = DBTools.selectSettingValue("use_slots_down");
@@ -795,6 +798,7 @@ public class SettingsDialog extends javax.swing.JDialog {
         smart_proxy_checkbox = new javax.swing.JCheckBox();
         max_down_speed_spinner = new javax.swing.JSpinner();
         verify_file_down_checkbox = new javax.swing.JCheckBox();
+        overwrite_existing_files_checkbox = new javax.swing.JCheckBox();
         use_mega_account_down_checkbox = new javax.swing.JCheckBox();
         max_downloads_spinner = new javax.swing.JSpinner();
         use_mega_account_down_combobox = new javax.swing.JComboBox<>();
@@ -976,6 +980,10 @@ public class SettingsDialog extends javax.swing.JDialog {
         verify_file_down_checkbox.setFont(new java.awt.Font("Dialog", 1, 18)); // NOI18N
         verify_file_down_checkbox.setText("Verify file integrity (when download is finished)");
         verify_file_down_checkbox.setDoubleBuffered(true);
+
+        overwrite_existing_files_checkbox.setFont(new java.awt.Font("Dialog", 1, 18)); // NOI18N
+        overwrite_existing_files_checkbox.setText("Overwrite existing files (if same name and size)");
+        overwrite_existing_files_checkbox.setDoubleBuffered(true);
 
         use_mega_account_down_checkbox.setFont(new java.awt.Font("Dialog", 1, 18)); // NOI18N
         use_mega_account_down_checkbox.setText("Allow using MEGA accounts for download/streaming");
@@ -1240,6 +1248,7 @@ public class SettingsDialog extends javax.swing.JDialog {
                             .addComponent(megacrypter_reverse_checkbox)
                             .addComponent(use_mega_account_down_checkbox)
                             .addComponent(verify_file_down_checkbox)
+                            .addComponent(overwrite_existing_files_checkbox)
                             .addComponent(limit_download_speed_checkbox)
                             .addComponent(clipboardspy_checkbox)
                             .addGroup(downloads_panelLayout.createSequentialGroup()
@@ -1298,6 +1307,8 @@ public class SettingsDialog extends javax.swing.JDialog {
                     .addComponent(max_down_speed_label))
                 .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.RELATED)
                 .addComponent(verify_file_down_checkbox)
+                .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.RELATED)
+                .addComponent(overwrite_existing_files_checkbox)
                 .addGap(18, 18, 18)
                 .addComponent(use_mega_account_down_checkbox)
                 .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.RELATED)
@@ -2193,6 +2204,7 @@ public class SettingsDialog extends javax.swing.JDialog {
             settings.put("max_downloads", String.valueOf(max_downloads_spinner.getValue()));
             settings.put("max_uploads", String.valueOf(max_uploads_spinner.getValue()));
             settings.put("verify_down_file", verify_file_down_checkbox.isSelected() ? "yes" : "no");
+            settings.put("overwrite_existing_files", overwrite_existing_files_checkbox.isSelected() ? "yes" : "no");
             settings.put("limit_download_speed", limit_download_speed_checkbox.isSelected() ? "yes" : "no");
             settings.put("max_download_speed", String.valueOf(max_down_speed_spinner.getValue()));
             settings.put("limit_upload_speed", limit_upload_speed_checkbox.isSelected() ? "yes" : "no");
@@ -3702,6 +3714,7 @@ public class SettingsDialog extends javax.swing.JDialog {
     private javax.swing.JLabel use_mega_label;
     private javax.swing.JCheckBox use_proxy_checkbox;
     private javax.swing.JCheckBox verify_file_down_checkbox;
+    private javax.swing.JCheckBox overwrite_existing_files_checkbox;
     private javax.swing.JLabel zoom_label;
     private javax.swing.JSpinner zoom_spinner;
     // End of variables declaration//GEN-END:variables

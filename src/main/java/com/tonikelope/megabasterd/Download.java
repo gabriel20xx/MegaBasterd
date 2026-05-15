@@ -601,6 +601,10 @@ public class Download implements Transference, Runnable, SecureSingleThreadNotif
                     path.mkdirs();
                 }
 
+                if ("yes".equals(selectSettingValue("overwrite_existing_files")) && _file.exists() && _file.length() == _file_size) {
+                    _file.delete();
+                }
+
                 if (!_file.exists() || _file.length() != _file_size) {
 
                     if (_file.exists()) {
