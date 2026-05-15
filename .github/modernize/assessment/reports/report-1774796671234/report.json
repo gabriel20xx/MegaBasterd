@@ -1,0 +1,1390 @@
+{
+  "version": "1.0.0",
+  "producer": "Java AppCAT CLI",
+  "metadata": {
+    "analysisStartTime": "2026-03-29T15:04:31.252Z",
+    "analysisEndTime": "2026-03-29T15:11:02.108Z",
+    "privacyMode": "Protected",
+    "privacyModeHelpUrl": "https://aka.ms/appmod-privacy-mode",
+    "targetIds": [],
+    "targetDisplayNames": [],
+    "capabilities": [
+      "openjdk21"
+    ],
+    "os": [],
+    "id": "1774796671234",
+    "name": "Report_202603291704",
+    "status": "completed",
+    "domains": [
+      "java-upgrade",
+      "security"
+    ],
+    "mode": "issue-only"
+  },
+  "summary": {
+    "totalProjects": 1,
+    "totalIssues": 2,
+    "totalIncidents": 39,
+    "totalEffort": 121,
+    "charts": {
+      "severity": {
+        "mandatory": 39,
+        "optional": 0,
+        "potential": 0,
+        "information": 0
+      },
+      "category": {
+        "deprecated-apis": 37,
+        "java-version-upgrade": 2
+      }
+    }
+  },
+  "projects": [
+    {
+      "path": ".",
+      "issues": 2,
+      "storyPoints": 121,
+      "properties": {
+        "appName": "MegaBasterd",
+        "jdkVersion": "1.8",
+        "frameworks": null,
+        "languages": [
+          "Java"
+        ],
+        "tools": [
+          "Maven"
+        ]
+      },
+      "incidents": [
+        {
+          "ruleId": "azure-java-version-02000",
+          "incidentId": "3494a6eb-db4a-4558-bd74-e6765bbfd12e",
+          "location": "pom.xml",
+          "locationKind": "File",
+          "line": 74,
+          "column": 0,
+          "targets": {
+            "azure-aks": {
+              "effort": 5,
+              "severity": "mandatory"
+            },
+            "azure-appservice": {
+              "effort": 5,
+              "severity": "mandatory"
+            },
+            "azure-container-apps": {
+              "effort": 5,
+              "severity": "mandatory"
+            }
+          },
+          "labels": [
+            "type=violation",
+            "ruleset=azure/springboot"
+          ]
+        },
+        {
+          "ruleId": "azure-java-version-02000",
+          "incidentId": "bb03bfe4-8209-4208-8709-a7b363f87883",
+          "location": "pom.xml",
+          "locationKind": "File",
+          "line": 75,
+          "column": 0,
+          "targets": {
+            "azure-aks": {
+              "effort": 5,
+              "severity": "mandatory"
+            },
+            "azure-appservice": {
+              "effort": 5,
+              "severity": "mandatory"
+            },
+            "azure-container-apps": {
+              "effort": 5,
+              "severity": "mandatory"
+            }
+          },
+          "labels": [
+            "type=violation",
+            "ruleset=azure/springboot"
+          ]
+        },
+        {
+          "ruleId": "java-20-deprecate-net-00000",
+          "incidentId": "0dc52abe-3af3-44a0-a045-3eb7d46a22e9",
+          "location": "src/main/java/com/tonikelope/megabasterd/ChunkDownloader.java",
+          "locationKind": "File",
+          "line": 243,
+          "column": 0,
+          "targets": {
+            "azure-aks": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-appservice": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-container-apps": {
+              "effort": 3,
+              "severity": "mandatory"
+            }
+          },
+          "labels": [
+            "type=violation",
+            "ruleset=openjdk21/openjdk17"
+          ]
+        },
+        {
+          "ruleId": "java-20-deprecate-net-00000",
+          "incidentId": "bf738dfe-4176-4e6e-a68c-a480cfc5cf54",
+          "location": "src/main/java/com/tonikelope/megabasterd/ChunkDownloader.java",
+          "locationKind": "File",
+          "line": 257,
+          "column": 0,
+          "targets": {
+            "azure-aks": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-appservice": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-container-apps": {
+              "effort": 3,
+              "severity": "mandatory"
+            }
+          },
+          "labels": [
+            "type=violation",
+            "ruleset=openjdk21/openjdk17"
+          ]
+        },
+        {
+          "ruleId": "java-20-deprecate-net-00000",
+          "incidentId": "8c0ba05d-d607-4398-ab57-77421cc4b608",
+          "location": "src/main/java/com/tonikelope/megabasterd/ChunkDownloader.java",
+          "locationKind": "File",
+          "line": 264,
+          "column": 0,
+          "targets": {
+            "azure-aks": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-appservice": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-container-apps": {
+              "effort": 3,
+              "severity": "mandatory"
+            }
+          },
+          "labels": [
+            "type=violation",
+            "ruleset=openjdk21/openjdk17"
+          ]
+        },
+        {
+          "ruleId": "java-20-deprecate-net-00000",
+          "incidentId": "3798f53b-1773-4fe9-a384-332552d4dea5",
+          "location": "src/main/java/com/tonikelope/megabasterd/ChunkDownloaderMono.java",
+          "locationKind": "File",
+          "line": 87,
+          "column": 0,
+          "targets": {
+            "azure-aks": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-appservice": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-container-apps": {
+              "effort": 3,
+              "severity": "mandatory"
+            }
+          },
+          "labels": [
+            "type=violation",
+            "ruleset=openjdk21/openjdk17"
+          ]
+        },
+        {
+          "ruleId": "java-20-deprecate-net-00000",
+          "incidentId": "8a8e5e88-fccc-40b0-9cb5-c94a04e050c3",
+          "location": "src/main/java/com/tonikelope/megabasterd/ChunkUploader.java",
+          "locationKind": "File",
+          "line": 156,
+          "column": 0,
+          "targets": {
+            "azure-aks": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-appservice": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-container-apps": {
+              "effort": 3,
+              "severity": "mandatory"
+            }
+          },
+          "labels": [
+            "type=violation",
+            "ruleset=openjdk21/openjdk17"
+          ]
+        },
+        {
+          "ruleId": "java-20-deprecate-net-00000",
+          "incidentId": "37995930-a5b3-46a7-9654-3b1ed260bf5d",
+          "location": "src/main/java/com/tonikelope/megabasterd/CryptTools.java",
+          "locationKind": "File",
+          "line": 345,
+          "column": 0,
+          "targets": {
+            "azure-aks": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-appservice": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-container-apps": {
+              "effort": 3,
+              "severity": "mandatory"
+            }
+          },
+          "labels": [
+            "type=violation",
+            "ruleset=openjdk21/openjdk17"
+          ]
+        },
+        {
+          "ruleId": "java-20-deprecate-net-00000",
+          "incidentId": "552f9bd3-af70-4074-b739-f9bb933fd63c",
+          "location": "src/main/java/com/tonikelope/megabasterd/CryptTools.java",
+          "locationKind": "File",
+          "line": 518,
+          "column": 0,
+          "targets": {
+            "azure-aks": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-appservice": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-container-apps": {
+              "effort": 3,
+              "severity": "mandatory"
+            }
+          },
+          "labels": [
+            "type=violation",
+            "ruleset=openjdk21/openjdk17"
+          ]
+        },
+        {
+          "ruleId": "java-20-deprecate-net-00000",
+          "incidentId": "fb9f56a3-686e-4ea0-8b7f-737595872764",
+          "location": "src/main/java/com/tonikelope/megabasterd/MegaAPI.java",
+          "locationKind": "File",
+          "line": 167,
+          "column": 0,
+          "targets": {
+            "azure-aks": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-appservice": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-container-apps": {
+              "effort": 3,
+              "severity": "mandatory"
+            }
+          },
+          "labels": [
+            "type=violation",
+            "ruleset=openjdk21/openjdk17"
+          ]
+        },
+        {
+          "ruleId": "java-20-deprecate-net-00000",
+          "incidentId": "9568227d-a164-4e25-a87b-42a2a41aea12",
+          "location": "src/main/java/com/tonikelope/megabasterd/MegaAPI.java",
+          "locationKind": "File",
+          "line": 203,
+          "column": 0,
+          "targets": {
+            "azure-aks": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-appservice": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-container-apps": {
+              "effort": 3,
+              "severity": "mandatory"
+            }
+          },
+          "labels": [
+            "type=violation",
+            "ruleset=openjdk21/openjdk17"
+          ]
+        },
+        {
+          "ruleId": "java-20-deprecate-net-00000",
+          "incidentId": "e8ab0f30-d370-4a55-8078-499eafee72d0",
+          "location": "src/main/java/com/tonikelope/megabasterd/MegaAPI.java",
+          "locationKind": "File",
+          "line": 221,
+          "column": 0,
+          "targets": {
+            "azure-aks": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-appservice": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-container-apps": {
+              "effort": 3,
+              "severity": "mandatory"
+            }
+          },
+          "labels": [
+            "type=violation",
+            "ruleset=openjdk21/openjdk17"
+          ]
+        },
+        {
+          "ruleId": "java-20-deprecate-net-00000",
+          "incidentId": "17246660-4940-4ff1-ac18-f9393ef58fdf",
+          "location": "src/main/java/com/tonikelope/megabasterd/MegaAPI.java",
+          "locationKind": "File",
+          "line": 291,
+          "column": 0,
+          "targets": {
+            "azure-aks": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-appservice": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-container-apps": {
+              "effort": 3,
+              "severity": "mandatory"
+            }
+          },
+          "labels": [
+            "type=violation",
+            "ruleset=openjdk21/openjdk17"
+          ]
+        },
+        {
+          "ruleId": "java-20-deprecate-net-00000",
+          "incidentId": "7db5d550-4edb-47dd-bbca-300478091935",
+          "location": "src/main/java/com/tonikelope/megabasterd/MegaAPI.java",
+          "locationKind": "File",
+          "line": 335,
+          "column": 0,
+          "targets": {
+            "azure-aks": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-appservice": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-container-apps": {
+              "effort": 3,
+              "severity": "mandatory"
+            }
+          },
+          "labels": [
+            "type=violation",
+            "ruleset=openjdk21/openjdk17"
+          ]
+        },
+        {
+          "ruleId": "java-20-deprecate-net-00000",
+          "incidentId": "cf8c3bfc-df83-443a-8f7a-4e1890f56e0d",
+          "location": "src/main/java/com/tonikelope/megabasterd/MegaAPI.java",
+          "locationKind": "File",
+          "line": 572,
+          "column": 0,
+          "targets": {
+            "azure-aks": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-appservice": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-container-apps": {
+              "effort": 3,
+              "severity": "mandatory"
+            }
+          },
+          "labels": [
+            "type=violation",
+            "ruleset=openjdk21/openjdk17"
+          ]
+        },
+        {
+          "ruleId": "java-20-deprecate-net-00000",
+          "incidentId": "3b1b10f3-9234-4aa8-a789-aba24fefe76f",
+          "location": "src/main/java/com/tonikelope/megabasterd/MegaAPI.java",
+          "locationKind": "File",
+          "line": 577,
+          "column": 0,
+          "targets": {
+            "azure-aks": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-appservice": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-container-apps": {
+              "effort": 3,
+              "severity": "mandatory"
+            }
+          },
+          "labels": [
+            "type=violation",
+            "ruleset=openjdk21/openjdk17"
+          ]
+        },
+        {
+          "ruleId": "java-20-deprecate-net-00000",
+          "incidentId": "1392c72d-7886-4f8b-8264-69885279da97",
+          "location": "src/main/java/com/tonikelope/megabasterd/MegaAPI.java",
+          "locationKind": "File",
+          "line": 610,
+          "column": 0,
+          "targets": {
+            "azure-aks": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-appservice": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-container-apps": {
+              "effort": 3,
+              "severity": "mandatory"
+            }
+          },
+          "labels": [
+            "type=violation",
+            "ruleset=openjdk21/openjdk17"
+          ]
+        },
+        {
+          "ruleId": "java-20-deprecate-net-00000",
+          "incidentId": "098bc6cd-63a1-41ad-81e1-310947ae84ab",
+          "location": "src/main/java/com/tonikelope/megabasterd/MegaAPI.java",
+          "locationKind": "File",
+          "line": 616,
+          "column": 0,
+          "targets": {
+            "azure-aks": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-appservice": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-container-apps": {
+              "effort": 3,
+              "severity": "mandatory"
+            }
+          },
+          "labels": [
+            "type=violation",
+            "ruleset=openjdk21/openjdk17"
+          ]
+        },
+        {
+          "ruleId": "java-20-deprecate-net-00000",
+          "incidentId": "b26e6073-988c-4577-a991-62447a12a4b3",
+          "location": "src/main/java/com/tonikelope/megabasterd/MegaAPI.java",
+          "locationKind": "File",
+          "line": 719,
+          "column": 0,
+          "targets": {
+            "azure-aks": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-appservice": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-container-apps": {
+              "effort": 3,
+              "severity": "mandatory"
+            }
+          },
+          "labels": [
+            "type=violation",
+            "ruleset=openjdk21/openjdk17"
+          ]
+        },
+        {
+          "ruleId": "java-20-deprecate-net-00000",
+          "incidentId": "2fe22e47-73a4-4671-be0f-bae26e69c63d",
+          "location": "src/main/java/com/tonikelope/megabasterd/MegaAPI.java",
+          "locationKind": "File",
+          "line": 762,
+          "column": 0,
+          "targets": {
+            "azure-aks": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-appservice": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-container-apps": {
+              "effort": 3,
+              "severity": "mandatory"
+            }
+          },
+          "labels": [
+            "type=violation",
+            "ruleset=openjdk21/openjdk17"
+          ]
+        },
+        {
+          "ruleId": "java-20-deprecate-net-00000",
+          "incidentId": "954038cd-94dc-42a1-9dab-9bedbbc4691c",
+          "location": "src/main/java/com/tonikelope/megabasterd/MegaAPI.java",
+          "locationKind": "File",
+          "line": 778,
+          "column": 0,
+          "targets": {
+            "azure-aks": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-appservice": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-container-apps": {
+              "effort": 3,
+              "severity": "mandatory"
+            }
+          },
+          "labels": [
+            "type=violation",
+            "ruleset=openjdk21/openjdk17"
+          ]
+        },
+        {
+          "ruleId": "java-20-deprecate-net-00000",
+          "incidentId": "3be3dd7a-45e4-42ec-8fa2-a903b3ba69a1",
+          "location": "src/main/java/com/tonikelope/megabasterd/MegaAPI.java",
+          "locationKind": "File",
+          "line": 820,
+          "column": 0,
+          "targets": {
+            "azure-aks": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-appservice": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-container-apps": {
+              "effort": 3,
+              "severity": "mandatory"
+            }
+          },
+          "labels": [
+            "type=violation",
+            "ruleset=openjdk21/openjdk17"
+          ]
+        },
+        {
+          "ruleId": "java-20-deprecate-net-00000",
+          "incidentId": "807d28ba-a93c-47ce-ada9-50839505170d",
+          "location": "src/main/java/com/tonikelope/megabasterd/MegaAPI.java",
+          "locationKind": "File",
+          "line": 849,
+          "column": 0,
+          "targets": {
+            "azure-aks": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-appservice": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-container-apps": {
+              "effort": 3,
+              "severity": "mandatory"
+            }
+          },
+          "labels": [
+            "type=violation",
+            "ruleset=openjdk21/openjdk17"
+          ]
+        },
+        {
+          "ruleId": "java-20-deprecate-net-00000",
+          "incidentId": "fd1b958c-dec2-4216-8ab0-deff9d0a0e60",
+          "location": "src/main/java/com/tonikelope/megabasterd/MegaAPI.java",
+          "locationKind": "File",
+          "line": 906,
+          "column": 0,
+          "targets": {
+            "azure-aks": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-appservice": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-container-apps": {
+              "effort": 3,
+              "severity": "mandatory"
+            }
+          },
+          "labels": [
+            "type=violation",
+            "ruleset=openjdk21/openjdk17"
+          ]
+        },
+        {
+          "ruleId": "java-20-deprecate-net-00000",
+          "incidentId": "b3f33825-ad96-4539-ba9d-28b72a1438e8",
+          "location": "src/main/java/com/tonikelope/megabasterd/MegaAPI.java",
+          "locationKind": "File",
+          "line": 936,
+          "column": 0,
+          "targets": {
+            "azure-aks": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-appservice": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-container-apps": {
+              "effort": 3,
+              "severity": "mandatory"
+            }
+          },
+          "labels": [
+            "type=violation",
+            "ruleset=openjdk21/openjdk17"
+          ]
+        },
+        {
+          "ruleId": "java-20-deprecate-net-00000",
+          "incidentId": "36eca2d5-9c7f-48be-970f-7532984298fd",
+          "location": "src/main/java/com/tonikelope/megabasterd/MegaAPI.java",
+          "locationKind": "File",
+          "line": 966,
+          "column": 0,
+          "targets": {
+            "azure-aks": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-appservice": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-container-apps": {
+              "effort": 3,
+              "severity": "mandatory"
+            }
+          },
+          "labels": [
+            "type=violation",
+            "ruleset=openjdk21/openjdk17"
+          ]
+        },
+        {
+          "ruleId": "java-20-deprecate-net-00000",
+          "incidentId": "b33941f2-0c9e-4b06-b92e-bc296d4728e3",
+          "location": "src/main/java/com/tonikelope/megabasterd/MegaAPI.java",
+          "locationKind": "File",
+          "line": 997,
+          "column": 0,
+          "targets": {
+            "azure-aks": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-appservice": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-container-apps": {
+              "effort": 3,
+              "severity": "mandatory"
+            }
+          },
+          "labels": [
+            "type=violation",
+            "ruleset=openjdk21/openjdk17"
+          ]
+        },
+        {
+          "ruleId": "java-20-deprecate-net-00000",
+          "incidentId": "44e94eea-94ca-4fa0-ba79-6db632f6ec39",
+          "location": "src/main/java/com/tonikelope/megabasterd/MegaAPI.java",
+          "locationKind": "File",
+          "line": 1044,
+          "column": 0,
+          "targets": {
+            "azure-aks": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-appservice": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-container-apps": {
+              "effort": 3,
+              "severity": "mandatory"
+            }
+          },
+          "labels": [
+            "type=violation",
+            "ruleset=openjdk21/openjdk17"
+          ]
+        },
+        {
+          "ruleId": "java-20-deprecate-net-00000",
+          "incidentId": "f5115c6f-13d0-4143-b8c8-1540f61b45c3",
+          "location": "src/main/java/com/tonikelope/megabasterd/MegaAPI.java",
+          "locationKind": "File",
+          "line": 1116,
+          "column": 0,
+          "targets": {
+            "azure-aks": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-appservice": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-container-apps": {
+              "effort": 3,
+              "severity": "mandatory"
+            }
+          },
+          "labels": [
+            "type=violation",
+            "ruleset=openjdk21/openjdk17"
+          ]
+        },
+        {
+          "ruleId": "java-20-deprecate-net-00000",
+          "incidentId": "59ace8d0-45e1-4d92-a073-db3a56c75086",
+          "location": "src/main/java/com/tonikelope/megabasterd/MegaAPI.java",
+          "locationKind": "File",
+          "line": 1286,
+          "column": 0,
+          "targets": {
+            "azure-aks": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-appservice": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-container-apps": {
+              "effort": 3,
+              "severity": "mandatory"
+            }
+          },
+          "labels": [
+            "type=violation",
+            "ruleset=openjdk21/openjdk17"
+          ]
+        },
+        {
+          "ruleId": "java-20-deprecate-net-00000",
+          "incidentId": "2f508f38-2519-4be8-875b-4e2d08dfb688",
+          "location": "src/main/java/com/tonikelope/megabasterd/MegaCrypterAPI.java",
+          "locationKind": "File",
+          "line": 125,
+          "column": 0,
+          "targets": {
+            "azure-aks": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-appservice": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-container-apps": {
+              "effort": 3,
+              "severity": "mandatory"
+            }
+          },
+          "labels": [
+            "type=violation",
+            "ruleset=openjdk21/openjdk17"
+          ]
+        },
+        {
+          "ruleId": "java-20-deprecate-net-00000",
+          "incidentId": "4c7965a1-a4d5-4a8e-980f-e7781d5cf302",
+          "location": "src/main/java/com/tonikelope/megabasterd/MegaCrypterAPI.java",
+          "locationKind": "File",
+          "line": 158,
+          "column": 0,
+          "targets": {
+            "azure-aks": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-appservice": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-container-apps": {
+              "effort": 3,
+              "severity": "mandatory"
+            }
+          },
+          "labels": [
+            "type=violation",
+            "ruleset=openjdk21/openjdk17"
+          ]
+        },
+        {
+          "ruleId": "java-20-deprecate-net-00000",
+          "incidentId": "eeb6f791-30df-4999-ae5d-21a6135a6f6a",
+          "location": "src/main/java/com/tonikelope/megabasterd/MiscTools.java",
+          "locationKind": "File",
+          "line": 1159,
+          "column": 0,
+          "targets": {
+            "azure-aks": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-appservice": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-container-apps": {
+              "effort": 3,
+              "severity": "mandatory"
+            }
+          },
+          "labels": [
+            "type=violation",
+            "ruleset=openjdk21/openjdk17"
+          ]
+        },
+        {
+          "ruleId": "java-20-deprecate-net-00000",
+          "incidentId": "da8a39f5-62ea-4ea9-a07c-c3e3339d4c78",
+          "location": "src/main/java/com/tonikelope/megabasterd/MiscTools.java",
+          "locationKind": "File",
+          "line": 1276,
+          "column": 0,
+          "targets": {
+            "azure-aks": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-appservice": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-container-apps": {
+              "effort": 3,
+              "severity": "mandatory"
+            }
+          },
+          "labels": [
+            "type=violation",
+            "ruleset=openjdk21/openjdk17"
+          ]
+        },
+        {
+          "ruleId": "java-20-deprecate-net-00000",
+          "incidentId": "da31d791-5b7f-4521-a41a-fc7a9987a067",
+          "location": "src/main/java/com/tonikelope/megabasterd/MiscTools.java",
+          "locationKind": "File",
+          "line": 1330,
+          "column": 0,
+          "targets": {
+            "azure-aks": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-appservice": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-container-apps": {
+              "effort": 3,
+              "severity": "mandatory"
+            }
+          },
+          "labels": [
+            "type=violation",
+            "ruleset=openjdk21/openjdk17"
+          ]
+        },
+        {
+          "ruleId": "java-20-deprecate-net-00000",
+          "incidentId": "d87fc522-383a-4f05-96b6-c2e40c3fbbc7",
+          "location": "src/main/java/com/tonikelope/megabasterd/SmartMegaProxyManager.java",
+          "locationKind": "File",
+          "line": 819,
+          "column": 0,
+          "targets": {
+            "azure-aks": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-appservice": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-container-apps": {
+              "effort": 3,
+              "severity": "mandatory"
+            }
+          },
+          "labels": [
+            "type=violation",
+            "ruleset=openjdk21/openjdk17"
+          ]
+        },
+        {
+          "ruleId": "java-20-deprecate-net-00000",
+          "incidentId": "1a244137-cdb4-41cb-8390-7ca47e1b8b47",
+          "location": "src/main/java/com/tonikelope/megabasterd/StreamChunkDownloader.java",
+          "locationKind": "File",
+          "line": 149,
+          "column": 0,
+          "targets": {
+            "azure-aks": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-appservice": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-container-apps": {
+              "effort": 3,
+              "severity": "mandatory"
+            }
+          },
+          "labels": [
+            "type=violation",
+            "ruleset=openjdk21/openjdk17"
+          ]
+        },
+        {
+          "ruleId": "java-20-deprecate-net-00000",
+          "incidentId": "ad3bb3f4-2fe5-4638-9b55-7d8f5484d7fa",
+          "location": "src/main/java/com/tonikelope/megabasterd/StreamChunkDownloader.java",
+          "locationKind": "File",
+          "line": 161,
+          "column": 0,
+          "targets": {
+            "azure-aks": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-appservice": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-container-apps": {
+              "effort": 3,
+              "severity": "mandatory"
+            }
+          },
+          "labels": [
+            "type=violation",
+            "ruleset=openjdk21/openjdk17"
+          ]
+        },
+        {
+          "ruleId": "java-20-deprecate-net-00000",
+          "incidentId": "eb043659-5d4e-4531-b01b-dc5193642c58",
+          "location": "src/main/java/com/tonikelope/megabasterd/StreamChunkDownloader.java",
+          "locationKind": "File",
+          "line": 168,
+          "column": 0,
+          "targets": {
+            "azure-aks": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-appservice": {
+              "effort": 3,
+              "severity": "mandatory"
+            },
+            "azure-container-apps": {
+              "effort": 3,
+              "severity": "mandatory"
+            }
+          },
+          "labels": [
+            "type=violation",
+            "ruleset=openjdk21/openjdk17"
+          ]
+        }
+      ]
+    }
+  ],
+  "rules": {
+    "azure-java-version-02000": {
+      "id": "azure-java-version-02000",
+      "description": "The application is using an old Java version. It is strongly recommended to plan and execute a migration strategy to upgrade your application to the latest stable Java version.\nOlder Java versions may have known security vulnerabilities that can expose your application and infrastructure to potential attacks. Migrating to a supported version ensures that you benefit from the latest security patches and updates.",
+      "title": "Legacy Java version",
+      "severity": "mandatory",
+      "effort": 5,
+      "labels": [
+        "target=azure-appservice",
+        "target=azure-aks",
+        "target=azure-container-apps",
+        "source",
+        "domain=java-upgrade",
+        "category=java-version-upgrade",
+        "version",
+        "os=windows",
+        "os=linux"
+      ]
+    },
+    "java-20-deprecate-net-00000": {
+      "id": "java-20-deprecate-net-00000",
+      "description": "The `java.net.URL` constructors are deprecated in JDK 20 release.\n\nDevelopers are encouraged to use `java.net.URI` to parse or construct a URL. In cases where an instance of `java.net.URL` is needed to open a connection, `java.net.URI` can be used to construct or parse the URL string, possibly calling `URI::parseServerAuthority()` to validate that the authority component can be parsed as a server-based authority, and then `calling URI::toURL()` to create the URL instance.\n\nA new method, `URL::of(URI, URLStreamHandler)` is provided for the advanced usages where there is a need to construct a URL with a given custom stream handler.",
+      "title": "java.net.URL Constructors Are Deprecated",
+      "severity": "mandatory",
+      "effort": 3,
+      "links": [
+        {
+          "url": "https://www.oracle.com/java/technologies/javase/20-relnote-issues.html#JDK-8294241",
+          "title": "java.net.URL Constructors Are Deprecated"
+        }
+      ],
+      "labels": [
+        "source=openjdk20-",
+        "source=openjdk",
+        "capability=openjdk20+",
+        "capability=openjdk",
+        "domain=java-upgrade",
+        "category=deprecated-apis",
+        "os=windows",
+        "os=linux",
+        "target=azure-appservice",
+        "target=azure-aks",
+        "target=azure-container-apps"
+      ]
+    }
+  },
+  "security": [
+    {
+      "id": "CWE-130",
+      "title": "Improper Handling of Length Parameter Inconsistency",
+      "category": "Code Quality",
+      "severity": "potential",
+      "description": "The product parses a formatted message or structure, but it does not handle or incorrectly handles a length field that is inconsistent with the actual length of the associated data.",
+      "evidence": {
+        "files": [
+          "src/main/java/com/tonikelope/megabasterd/CryptTools.java"
+        ],
+        "explanation": "In CryptTools.java, the method that parses ELC binary data reads length fields (bin_links_length, url_bin_length, pass_bin_length) directly from external-controlled binary content using ByteBuffer without validating they are consistent with the actual remaining data length. For example, bin_links_length is read from bytes 0–3 of the payload and immediately used in Arrays.copyOfRange(elc_byte, 4, 4 + bin_links_length) with no upper-bound check against elc_byte.length, risking out-of-bounds access or excessive allocation if the declared length exceeds the real data."
+      },
+      "storyPoint": "3"
+    },
+    {
+      "id": "CWE-477",
+      "title": "Use of Obsolete Function",
+      "category": "Code Quality",
+      "severity": "optional",
+      "description": "The code uses deprecated or obsolete functions, which suggests that the code has not been actively reviewed or maintained.",
+      "evidence": {
+        "files": [
+          "src/main/java/com/tonikelope/megabasterd/MainPanel.java",
+          "src/main/java/com/tonikelope/megabasterd/MiscTools.java",
+          "src/main/java/com/tonikelope/megabasterd/SettingsDialog.java"
+        ],
+        "explanation": "Runtime.getRuntime().exec() is invoked in MainPanel.java (line 871: exec(_run_command_path)), MiscTools.java (line 1400: exec(new String[]{\"xdg-open\", url}) and line 1460: exec(cmd.toString())), and SettingsDialog.java (line 3146: exec(run_command_textbox.getText().trim())). This obsolete, unsafe API does not safely handle arguments containing spaces or shell metacharacters, and the ProcessBuilder API is the modern recommended replacement."
+      },
+      "storyPoint": "1"
+    },
+    {
+      "id": "CWE-571",
+      "title": "Expression is Always True",
+      "category": "Code Quality",
+      "severity": "optional",
+      "description": "The product contains an expression that will always evaluate to true.",
+      "evidence": {
+        "files": [
+          "src/main/java/com/tonikelope/megabasterd/MegaProxyServer.java"
+        ],
+        "explanation": "In MegaProxyServer.java (approximately line 68), the loop condition while ((socket = _serverSocket.accept()) != null) contains an expression that is always true. ServerSocket.accept() never returns null — it either returns a valid connected Socket or throws an IOException. The != null guard is superfluous and the boolean expression always evaluates to true, masking the real termination mechanism (exception-based)."
+      },
+      "storyPoint": "1"
+    },
+    {
+      "id": "CWE-681",
+      "title": "Incorrect Conversion between Numeric Types",
+      "category": "Code Quality",
+      "severity": "potential",
+      "description": "When converting from one data type to another, such as long to integer, data can be omitted or translated in a way that produces unexpected values. If the resulting values are used in a sensitive context, then dangerous behaviors may occur.",
+      "evidence": {
+        "files": [
+          "src/main/java/com/tonikelope/megabasterd/ChunkDownloaderMono.java",
+          "src/main/java/com/tonikelope/megabasterd/ChunkWriterManager.java"
+        ],
+        "explanation": "In ChunkDownloaderMono.java (line 145), the expression Math.min((int) (chunk_size - chunk_reads), buffer.length) casts a long subtraction result to int without bounds validation; if chunk_size - chunk_reads exceeds Integer.MAX_VALUE the value is silently truncated. In ChunkWriterManager.java (line 37), calculateChunkOffset casts long chunk_id to int via (int) chunk_id - 1 for array indexing; although guarded by chunk_id <= 7 in practice, the explicit unsafe cast pattern is present."
+      },
+      "storyPoint": "3"
+    },
+    {
+      "id": "CWE-682",
+      "title": "Incorrect Calculation",
+      "category": "Code Quality",
+      "severity": "potential",
+      "description": "The product performs a calculation that generates incorrect or unintended results that are later used in security-critical decisions or resource management.",
+      "evidence": {
+        "files": [
+          "src/main/java/com/tonikelope/megabasterd/SmartMegaProxyManager.java"
+        ],
+        "explanation": "In SmartMegaProxyManager.java (line 103), the loop condition uses System.currentTimeMillis() < _last_refresh_timestamp + _autorefresh_time * 60 * 1000. The field _autorefresh_time is a volatile int (line 63) parsed from user-controlled settings. The multiplication _autorefresh_time * 60 * 1000 is performed entirely in 32-bit integer arithmetic before promotion to long, so values of _autorefresh_time >= ~35,792 cause integer overflow, producing an incorrect (possibly negative) delay threshold and breaking the intended refresh scheduling."
+      },
+      "storyPoint": "5"
+    },
+    {
+      "id": "CWE-772",
+      "title": "Missing Release of Resource after Effective Lifetime",
+      "category": "Code Quality",
+      "severity": "potential",
+      "description": "The product does not release a resource after its effective lifetime has ended, i.e., after the resource is no longer needed.",
+      "evidence": {
+        "files": [
+          "src/main/java/com/tonikelope/megabasterd/MainPanel.java",
+          "src/main/java/com/tonikelope/megabasterd/ChunkDownloaderMono.java",
+          "src/main/java/com/tonikelope/megabasterd/CryptTools.java",
+          "src/main/java/com/tonikelope/megabasterd/MegaCrypterAPI.java"
+        ],
+        "explanation": "Multiple HttpURLConnection objects are declared as con = null and opened inside try blocks across ChunkDownloaderMono.java, CryptTools.java, and MegaCrypterAPI.java; in some exception paths disconnect() is not guaranteed to be called, leaving the underlying TCP connection unreleased. In MainPanel.java (line 274), a PrintStream wrapping a FileOutputStream is assigned to a field without a try-with-resources block, so if the application exits abnormally the descriptor is not explicitly released. In ChunkDownloaderMono.java, CipherInputStream cis = null may not be closed in all code paths."
+      },
+      "storyPoint": "3"
+    },
+    {
+      "id": "CWE-775",
+      "title": "Missing Release of File Descriptor or Handle after Effective Lifetime",
+      "category": "Code Quality",
+      "severity": "potential",
+      "description": "The product does not release a file descriptor or handle after its effective lifetime has ended, i.e., after the file descriptor/handle is no longer needed.",
+      "evidence": {
+        "files": [
+          "src/main/java/com/tonikelope/megabasterd/MiscTools.java",
+          "src/main/java/com/tonikelope/megabasterd/MainPanel.java"
+        ],
+        "explanation": "In MiscTools.java (line 151), computeFileSHA1 opens BufferedInputStream fis = new BufferedInputStream(new FileInputStream(file)) outside any try-with-resources or finally/close block; if any exception is thrown after opening (e.g., in MessageDigest.getInstance or during read), the underlying file descriptor is never closed. In MainPanel.java (line 274), a PrintStream(new FileOutputStream(...)) is opened without try-with-resources, so abnormal termination leaves the log file descriptor open."
+      },
+      "storyPoint": "3"
+    },
+    {
+      "id": "CWE-789",
+      "title": "Memory Allocation with Excessive Size Value",
+      "category": "Code Quality",
+      "severity": "potential",
+      "description": "The product allocates memory based on an untrusted, large size value, but it does not ensure that the size is within expected limits, allowing arbitrary amounts of memory to be allocated.",
+      "evidence": {
+        "files": [
+          "src/main/java/com/tonikelope/megabasterd/CryptTools.java"
+        ],
+        "explanation": "In CryptTools.java, the ELC parser reads bin_links_length as a signed 32-bit integer directly from attacker-controlled binary data and immediately allocates Arrays.copyOfRange(elc_byte, 4, 4 + bin_links_length) without validating that bin_links_length is within the bounds of the actual payload. A crafted ELC payload with a large length field can cause allocation of an arbitrarily large array, potentially exhausting heap memory."
+      },
+      "storyPoint": "5"
+    },
+    {
+      "id": "CWE-835",
+      "title": "Loop with Unreachable Exit Condition ('Infinite Loop')",
+      "category": "Code Quality",
+      "severity": "potential",
+      "description": "The product contains an iteration or loop with an exit condition that cannot be reached, i.e., an infinite loop.",
+      "evidence": {
+        "files": [
+          "src/main/java/com/tonikelope/megabasterd/MainPanel.java",
+          "src/main/java/com/tonikelope/megabasterd/SpeedMeter.java",
+          "src/main/java/com/tonikelope/megabasterd/StreamThrottlerSupervisor.java",
+          "src/main/java/com/tonikelope/megabasterd/TransferenceManager.java",
+          "src/main/java/com/tonikelope/megabasterd/SmartMegaProxyManager.java"
+        ],
+        "explanation": "Multiple while(true) and do { ... } while(true) loops with no reachable exit condition are present: MainPanel.java lines 382 (memory monitor loop) and 1212 (watchdog socket loop); SpeedMeter.java line 216 (do { ... } while(true) speed update loop); StreamThrottlerSupervisor.java line 159 (throttle queue swap loop); TransferenceManager.java line 728 (transference removal loop); SmartMegaProxyManager.java line 101 (proxy auto-refresh outer loop). These loops run on background threads and rely solely on thread interruption or JVM shutdown to terminate, with no explicit in-loop exit condition."
+      },
+      "storyPoint": "3"
+    },
+    {
+      "id": "CWE-567",
+      "title": "Unsynchronized Access to Shared Data in a Multithreaded Context",
+      "category": "Concurrency & Synchronization",
+      "severity": "potential",
+      "description": "The product does not properly synchronize shared data, such as static variables across threads, which can lead to undefined behavior and unpredictable data changes.",
+      "evidence": {
+        "files": [
+          "src/main/java/com/tonikelope/megabasterd/MainPanel.java",
+          "src/main/java/com/tonikelope/megabasterd/MegaAPI.java"
+        ],
+        "explanation": "MainPanel.java declares multiple non-volatile static fields (_proxy_host, _proxy_port, _use_proxy, _proxy_user, _proxy_pass, _language, _new_version, _resume_uploads, _resume_downloads at lines 89-102) that are written without synchronization inside loadUserSettings() (line 608) — an unsynchronized instance method — while concurrent download and upload worker threads (ChunkDownloader, ChunkUploader, ChunkDownloaderMono) read these same fields via unsynchronized getters such as getProxy_host(), getProxy_port(), and isUse_proxy(). Additionally, MegaAPI.java declares public static String API_KEY = null (line 52) without volatile, written unsynchronized in MainPanel.loadUserSettings() (line 857) and potentially read from multiple concurrent request threads."
+      },
+      "storyPoint": "5"
+    },
+    {
+      "id": "CWE-662",
+      "title": "Improper Synchronization",
+      "category": "Concurrency & Synchronization",
+      "severity": "potential",
+      "description": "The product utilizes multiple threads or processes to allow temporary access to a shared resource that can only be exclusive to one process at a time, but it does not properly synchronize these actions, which might cause simultaneous accesses of this resource by multiple threads or processes.",
+      "evidence": {
+        "files": [
+          "src/main/java/com/tonikelope/megabasterd/MainPanel.java"
+        ],
+        "explanation": "MainPanel.java exposes shared mutable static state (proxy settings, language, API key, run-command configuration) that multiple concurrent threads access simultaneously without coordinated synchronization. The loadUserSettings() method (line 608) writes to static fields such as _proxy_host, _proxy_port, _use_proxy, _language, and MegaAPI.API_KEY without holding any lock, while run_external_command() (line ~862) is declared static synchronized and reads _run_command, _run_command_path, and LAST_EXTERNAL_COMMAND_TIMESTAMP — meaning the same shared resources are sometimes protected by a lock and sometimes not, leaving the synchronization incomplete and ineffective for all concurrent access paths."
+      },
+      "storyPoint": "8"
+    },
+    {
+      "id": "CWE-667",
+      "title": "Improper Locking",
+      "category": "Concurrency & Synchronization",
+      "severity": "potential",
+      "description": "The product does not properly acquire or release a lock on a resource, leading to unexpected resource state changes and behaviors.",
+      "evidence": {
+        "files": [
+          "src/main/java/com/tonikelope/megabasterd/MainPanel.java"
+        ],
+        "explanation": "MainPanel.java declares run_external_command() as static synchronized (synchronizing on MainPanel.class) and within it reads the static fields _run_command, _run_command_path, and LAST_EXTERNAL_COMMAND_TIMESTAMP. However, loadUserSettings() (line 608) writes to _run_command (line ~800) and _run_command_path (line ~807) without acquiring the MainPanel.class lock. Because the writer never holds the lock that the reader relies on, the lock provides no mutual exclusion, constituting improper locking: the resource is not properly protected across all code paths that access it."
+      },
+      "storyPoint": "8"
+    },
+    {
+      "id": "CWE-820",
+      "title": "Missing Synchronization",
+      "category": "Concurrency & Synchronization",
+      "severity": "potential",
+      "description": "The product utilizes a shared resource in a concurrent manner but does not attempt to synchronize access to the resource.",
+      "evidence": {
+        "files": [
+          "src/main/java/com/tonikelope/megabasterd/MainPanel.java",
+          "src/main/java/com/tonikelope/megabasterd/MegaAPI.java"
+        ],
+        "explanation": "MainPanel.java holds numerous static fields (_proxy_host, _proxy_port, _use_proxy, _proxy_user, _proxy_pass, _use_smart_proxy, _run_command, _run_command_path, _language, _new_version, _resume_uploads, _resume_downloads at lines 89-102) that are shared across the main thread, the Swing EDT (SettingsDialog calling loadUserSettings() at line 3306), and multiple concurrent download/upload worker threads. None of these fields is declared volatile, and neither loadUserSettings() nor any of the getter methods (getProxy_host(), isUse_proxy(), etc.) uses any synchronization, so there is no attempt whatsoever to synchronize concurrent access. Similarly, MegaAPI.API_KEY (line 52) is a mutable public static field with no synchronization protection."
+      },
+      "storyPoint": "8"
+    },
+    {
+      "id": "CWE-821",
+      "title": "Incorrect Synchronization",
+      "category": "Concurrency & Synchronization",
+      "severity": "potential",
+      "description": "The product utilizes a shared resource in a concurrent manner, but it does not correctly synchronize access to the resource.",
+      "evidence": {
+        "files": [
+          "src/main/java/com/tonikelope/megabasterd/MainPanel.java"
+        ],
+        "explanation": "MainPanel.java applies synchronization inconsistently over shared static state. run_external_command() is declared static synchronized, causing it to acquire the MainPanel.class monitor before reading _run_command, _run_command_path, and LAST_EXTERNAL_COMMAND_TIMESTAMP. However, loadUserSettings() (line 608) writes to _run_command and _run_command_path outside any synchronized block, and all getter methods (getProxy_host(), isUse_proxy(), getLanguage(), etc.) read the remaining static fields without synchronization. The partial synchronization creates a false sense of safety: the synchronized read in run_external_command() does not prevent a concurrent unsynchronized write in loadUserSettings() from producing data races and unpredictable behavior."
+      },
+      "storyPoint": "8"
+    },
+    {
+      "id": "CWE-321",
+      "title": "Use of Hard-coded Cryptographic Key",
+      "category": "Credentials & Secrets",
+      "severity": "potential",
+      "description": "The product uses a hard-coded, unchangeable cryptographic key.",
+      "evidence": {
+        "files": [
+          "src/main/java/com/tonikelope/megabasterd/CryptTools.java"
+        ],
+        "explanation": "CryptTools defines a hardcoded all-zero AES initialization vector at lines 54-56: `public static final int[] AES_ZERO_IV_I32A = {0, 0, 0, 0}` and `public static final byte[] AES_ZERO_IV = i32a2bin(AES_ZERO_IV_I32A)`. This fixed, predictable IV is used throughout the codebase (MegaAPI.java, MiscTools.java, SettingsDialog.java, CryptTools.java) for AES-CBC encryption and decryption of sensitive data including account passwords, API keys, and session tokens, effectively making the IV constant and defeating the security properties of CBC mode."
+      },
+      "storyPoint": "5"
+    },
+    {
+      "id": "CWE-732",
+      "title": "Incorrect Permission Assignment for Critical Resource",
+      "category": "Credentials & Secrets",
+      "severity": "optional",
+      "description": "The product specifies permissions for a security-critical resource in a way that allows that resource to be read or modified by unintended actors.",
+      "evidence": {
+        "files": [
+          "src/main/java/com/tonikelope/megabasterd/SmartMegaProxyManager.java"
+        ],
+        "explanation": "SmartMegaProxyManager.java at line 419 sets the charon VPN log file permissions to `rw-rw-rw-` (world-readable and world-writable) via `Files.setPosixFilePermissions(charonLogFile, PosixFilePermissions.fromString(\"rw-rw-rw-\"))`. This grants any local user on the system read and write access to the IKEv2 VPN connection log, which may contain sensitive connection details, credentials metadata, and authentication events."
+      },
+      "storyPoint": "5"
+    },
+    {
+      "id": "CWE-778",
+      "title": "Insufficient Logging",
+      "category": "Credentials & Secrets",
+      "severity": "potential",
+      "description": "When a security-critical event occurs, the product either does not record the event or omits important details about the event when logging it.",
+      "evidence": {
+        "files": [
+          "src/main/java/com/tonikelope/megabasterd/MegaAPI.java"
+        ],
+        "explanation": "MegaAPI._realLogin() (line 157) and MegaAPI.login() (line 233) perform account authentication against the MEGA API but contain no logging of authentication outcomes—neither successful logins nor authentication failures are recorded. When the login fails (e.g., wrong credentials, invalid 2FA PIN, suspended account), the method throws an exception that is silently caught in callers without any security-relevant log entry, making it impossible to audit authentication events or detect brute-force attempts."
+      },
+      "storyPoint": "3"
+    },
+    {
+      "id": "CWE-502",
+      "title": "Deserialization of Untrusted Data",
+      "category": "Injection Attacks",
+      "severity": "mandatory",
+      "description": "The product deserializes untrusted data without sufficiently ensuring that the resulting data will be valid.",
+      "evidence": {
+        "files": [
+          "src/main/java/com/tonikelope/megabasterd/SettingsDialog.java",
+          "src/main/java/com/tonikelope/megabasterd/MiscTools.java"
+        ],
+        "explanation": "SettingsDialog.importSettings() at line 3296 creates an ObjectInputStream directly from a user-selected file (via JFileChooser) and calls readObject() with no ObjectInputFilter or class allowlist, allowing deserialization of arbitrary types from an untrusted file. MiscTools.java at lines 1617 and 1629 also calls readObject() on ObjectInputStream wrapping bytes retrieved from the local SQLite database (the non-encrypted branch at line 1629 deserializes raw database bytes without any type validation)."
+      },
+      "storyPoint": "13"
+    }
+  ]
+}

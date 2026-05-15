@@ -1,0 +1,8 @@
+assessmentDomains:
+  - java-upgrade
+  - security
+analysisCoverage: issue-only
+targetRuntime: openjdk21
+targetComputeServices: []
+targetOS: []
+enableContainerization: false
