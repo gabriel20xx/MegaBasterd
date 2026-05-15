@@ -21,6 +21,7 @@ RUN apt-get update \
         openresolv \
         strongswan \
         libcharon-extra-plugins \
+        supervisor \
         wireguard-tools \
         websockify \
         x11vnc \
@@ -37,6 +38,7 @@ WORKDIR /app
 COPY --from=build /build/target/*jar-with-dependencies.jar /app/megabasterd.jar
 
 COPY docker/entrypoint.sh /entrypoint.sh
+COPY docker/supervisord.conf /etc/supervisord.conf
 RUN chmod +x /entrypoint.sh
 
 VOLUME ["/config", "/downloads", "/wireguard"]
