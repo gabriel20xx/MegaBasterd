@@ -24,7 +24,7 @@ import javax.swing.JOptionPane;
 public class AboutDialog extends javax.swing.JDialog {
 
     public static final String MEGA_URL = "https://mega.nz/";
-    public static final String MEGABASTERD_URL = "https://github.com/tonikelope/megabasterd/releases/latest";
+    public static final String MEGABASTERD_URL = "https://github.com/gabriel20xx/megabasterd/releases/latest";
     public static final String TONIKELOPE_URL = "https://github.com/tonikelope/";
     public static final String MEGACRYPTER_URL = "https://tonikelope.github.io/megacrypter/";
     public static final String SPAIN_URL = "https://en.wikipedia.org/wiki/Spain";
