@@ -61,6 +61,7 @@ import java.nio.file.Paths;
 import java.security.CodeSource;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.security.SecureRandom;
 import java.text.DateFormat;
 import java.text.DecimalFormat;
 import java.text.SimpleDateFormat;
@@ -74,7 +75,6 @@ import java.util.Enumeration;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Random;
 import java.util.concurrent.Callable;
 import java.util.concurrent.FutureTask;
 import java.util.logging.Level;
@@ -189,10 +189,39 @@ public class MiscTools {
     public static void purgeFolderCache() {
         File directory = new File(System.getProperty("java.io.tmpdir"));
 
-        for (File f : directory.listFiles()) {
+        File[] entries = directory.listFiles();
+        if (entries == null) {
+            return;
+        }
+
+        for (File f : entries) {
             if (f.isFile() && f.getName().startsWith("megabasterd_folder_cache_")) {
                 f.delete();
                 Logger.getLogger(MiscTools.class.getName()).log(Level.INFO, "REMOVING FOLDER CACHE FILE {0}", f.getAbsolutePath());
+            }
+        }
+    }
+
+    public static void purgeOrphanThumbnails() {
+
+        // Thumbnails are normally consumed by Upload.run within seconds and
+        // then deleted, but if MegaBasterd crashed or was force-killed
+        // mid-upload they orphan in java.io.tmpdir. Sweep on startup so the
+        // tmpdir doesn't fill over time.
+        File directory = new File(System.getProperty("java.io.tmpdir"));
+
+        File[] entries = directory.listFiles();
+        if (entries == null) {
+            return;
+        }
+
+        long cutoff = System.currentTimeMillis() - 60L * 60L * 1000L; // 1h grace
+
+        for (File f : entries) {
+            if (f.isFile() && f.getName().startsWith("megabasterd_thumbnail_") && f.lastModified() < cutoff) {
+                if (f.delete()) {
+                    Logger.getLogger(MiscTools.class.getName()).log(Level.FINE, "REMOVING ORPHAN THUMBNAIL {0}", f.getAbsolutePath());
+                }
             }
         }
     }
@@ -248,7 +277,7 @@ public class MiscTools {
 
         Date currentDate = new Date(System.currentTimeMillis());
 
-        DateFormat df = new SimpleDateFormat(format);
+        DateFormat df = new SimpleDateFormat(format, java.util.Locale.ROOT);
 
         return df.format(currentDate);
     }
@@ -376,20 +405,20 @@ public class MiscTools {
         return bimage;
     }
 
+    private static final SecureRandom SECURE_RANDOM = new SecureRandom();
+
     public static String genID(int length) {
 
         String pos = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 
-        String res = "";
-
-        Random randomno = new Random();
+        StringBuilder res = new StringBuilder(length);
 
         for (int i = 0; i < length; i++) {
 
-            res += pos.charAt(randomno.nextInt(pos.length()));
+            res.append(pos.charAt(SECURE_RANDOM.nextInt(pos.length())));
         }
 
-        return res;
+        return res.toString();
     }
 
     public static byte[] long2bytearray(long val) {
@@ -408,12 +437,60 @@ public class MiscTools {
 
         long l = 0;
 
-        for (int i = 0; i <= 7; i++) {
-            l += val[i];
-            l <<= 8;
+        for (int i = 0; i < 8; i++) {
+            l = (l << 8) | (val[i] & 0xFFL);
         }
 
         return l;
+    }
+
+    public static void drainAndCloseErrorStream(HttpURLConnection con) {
+
+        if (con == null) {
+            return;
+        }
+
+        InputStream es = con.getErrorStream();
+
+        if (es == null) {
+            return;
+        }
+
+        try (InputStream toDrain = es) {
+            byte[] buf = new byte[4096];
+            while (toDrain.read(buf) != -1) {
+                // discard
+            }
+        } catch (IOException ignore) {
+        }
+    }
+
+    public static int parseIntOr(String value, int fallback) {
+
+        if (value == null) {
+            return fallback;
+        }
+
+        try {
+            return Integer.parseInt(value.trim());
+        } catch (NumberFormatException ex) {
+            Logger.getLogger(MiscTools.class.getName()).log(Level.WARNING, "Bad integer setting {0}, using fallback {1}", new Object[]{value, fallback});
+            return fallback;
+        }
+    }
+
+    public static long parseLongOr(String value, long fallback) {
+
+        if (value == null) {
+            return fallback;
+        }
+
+        try {
+            return Long.parseLong(value.trim());
+        } catch (NumberFormatException ex) {
+            Logger.getLogger(MiscTools.class.getName()).log(Level.WARNING, "Bad long setting {0}, using fallback {1}", new Object[]{value, fallback});
+            return fallback;
+        }
     }
 
     public static String findFirstRegex(String regex, String data, int group) {
@@ -465,16 +542,21 @@ public class MiscTools {
 
             Font new_font = font.deriveFont(old_font.getStyle(), Math.round(old_font.getSize() * zoom_factor));
 
-            boolean error;
-
-            do {
+            // Cap retries: setFont should not throw, but if it does (headless
+            // contexts have surfaced odd cases) we don't want to spin the EDT
+            // forever as the old "do { ... } while (error)" with no bound did.
+            int attempts = 0;
+            while (true) {
                 try {
                     component.setFont(new_font);
-                    error = false;
+                    break;
                 } catch (Exception ex) {
-                    error = true;
+                    if (++attempts >= 3) {
+                        Logger.getLogger(MiscTools.class.getName()).log(Level.WARNING, "setFont failed after {0} attempts: {1}", new Object[]{attempts, ex.getMessage()});
+                        break;
+                    }
                 }
-            } while (error);
+            }
 
         }
     }
@@ -555,7 +637,7 @@ public class MiscTools {
             sequencer.start();
             return sequencer;
         } catch (MidiUnavailableException | InvalidMidiDataException | IOException ex) {
-            ex.printStackTrace();
+            Logger.getLogger(MiscTools.class.getName()).log(Level.SEVERE, null, ex);
         }
         return null;
     }
@@ -630,23 +712,41 @@ public class MiscTools {
 
     }
 
+    public static final boolean STRICT_EDT_CHECKS = Boolean.getBoolean("megabasterd.strict_edt");
+
+    private static Runnable _wrapEdtCheck(Runnable r) {
+        if (!STRICT_EDT_CHECKS) {
+            return r;
+        }
+        return () -> {
+            if (!SwingUtilities.isEventDispatchThread()) {
+                Logger.getLogger(MiscTools.class.getName()).log(Level.WARNING, "GUIRun body executed off-EDT", new IllegalStateException());
+            }
+            r.run();
+        };
+    }
+
     public static void GUIRun(Runnable r) {
 
+        Runnable runnable = _wrapEdtCheck(r);
+
         if (!SwingUtilities.isEventDispatchThread()) {
-            SwingUtilities.invokeLater(r);
+            SwingUtilities.invokeLater(runnable);
         } else {
-            r.run();
+            runnable.run();
         }
 
     }
 
     public static void GUIRunAndWait(Runnable r) {
 
+        Runnable runnable = _wrapEdtCheck(r);
+
         try {
             if (!SwingUtilities.isEventDispatchThread()) {
-                SwingUtilities.invokeAndWait(r);
+                SwingUtilities.invokeAndWait(runnable);
             } else {
-                r.run();
+                runnable.run();
             }
         } catch (Exception ex) {
 
@@ -660,9 +760,7 @@ public class MiscTools {
 
         FutureTask f = new FutureTask(c);
 
-        Thread hilo = new Thread(f);
-
-        hilo.start();
+        THREAD_POOL.execute(f);
 
         return f;
     }
@@ -693,19 +791,28 @@ public class MiscTools {
 
     }
 
+    private static final String[] FORMAT_BYTES_UNITS = {"B", "KB", "MB", "GB", "TB"};
+
+    // DecimalFormat is not thread-safe but is allocated on hot paths (every
+    // SpeedMeter tick × every row, every memory-monitor tick, every JTree
+    // cell paint). Cache one per thread. Locale.ROOT for consistent
+    // "1.5 MB" across locales (was "1,5 MB" on Spanish/German systems).
+    private static final ThreadLocal<DecimalFormat> FORMAT_BYTES_DF = ThreadLocal.withInitial(
+            () -> new DecimalFormat("#.##", java.text.DecimalFormatSymbols.getInstance(java.util.Locale.ROOT)));
+
     public static String formatBytes(Long bytes) {
 
-        String[] units = {"B", "KB", "MB", "GB", "TB"};
+        if (bytes == null) {
+            return "0 B";
+        }
 
-        bytes = Math.max(bytes, 0L);
+        long b = Math.max(bytes, 0L);
 
-        int pow = Math.min((int) ((bytes > 0L ? Math.log(bytes) : 0) / Math.log(1024)), units.length - 1);
+        int pow = Math.min((int) ((b > 0L ? Math.log(b) : 0) / Math.log(1024)), FORMAT_BYTES_UNITS.length - 1);
 
-        Double bytes_double = (double) bytes / (1L << (10 * pow));
+        double bytes_double = (double) b / (1L << (10 * pow));
 
-        DecimalFormat df = new DecimalFormat("#.##");
-
-        return df.format(bytes_double) + ' ' + units[pow];
+        return FORMAT_BYTES_DF.get().format(bytes_double) + ' ' + FORMAT_BYTES_UNITS[pow];
     }
 
     public static MegaMutableTreeNode calculateTreeFolderSizes(MegaMutableTreeNode node) {
@@ -992,23 +1099,61 @@ public class MiscTools {
         return (text.length() > max_length) ? text.replaceAll("^(.{1," + (max_length / 2) + "}).*?(.{1," + (max_length / 2) + "})$", "$1" + separator + "$2") : text;
     }
 
+    private static final boolean IS_WINDOWS = System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT).contains("win");
+
+    private static final java.util.regex.Pattern WIN_RESERVED_NAMES = java.util.regex.Pattern.compile(
+            "^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\\.|$)", java.util.regex.Pattern.CASE_INSENSITIVE);
+
+    public static boolean isWindowsOS() {
+        return IS_WINDOWS;
+    }
+
     public static String cleanFilename(String filename) {
 
-        return (System.getProperty("os.name").toLowerCase().contains("win") ? filename.replaceAll("[<>:\"/\\\\\\|\\?\\*\t]+", "") : filename).replaceAll("\\" + File.separator, "").replaceAll("\\.\\.+", "__").replaceAll("[\\x00-\\x1F]", "").trim();
+        String cleaned = (IS_WINDOWS ? filename.replaceAll("[<>:\"/\\\\\\|\\?\\*\t]+", "") : filename)
+                .replaceAll("\\" + File.separator, "")
+                .replaceAll("\\.\\.+", "__")
+                .replaceAll("[\\x00-\\x1F]", "")
+                .trim();
+
+        if (IS_WINDOWS) {
+            // Windows reserved names: CON, PRN, AUX, NUL, COM1..COM9, LPT1..LPT9.
+            // Forbidden as bare name or as basename even with extension.
+            if (WIN_RESERVED_NAMES.matcher(cleaned).find()) {
+                cleaned = "_" + cleaned;
+            }
+            // Trailing dots and spaces are illegal on Windows.
+            while (cleaned.endsWith(".") || cleaned.endsWith(" ")) {
+                cleaned = cleaned.substring(0, cleaned.length() - 1);
+            }
+        }
+
+        // Bound filename to 250 bytes-ish to leave room within the typical
+        // 255 char filename limit and the 260 char Windows MAX_PATH.
+        if (cleaned.length() > 250) {
+            int dot = cleaned.lastIndexOf('.');
+            String ext = (dot >= 0 && dot > cleaned.length() - 16) ? cleaned.substring(dot) : "";
+            String base = (dot >= 0 && dot > cleaned.length() - 16) ? cleaned.substring(0, dot) : cleaned;
+            int keep = 250 - ext.length();
+            if (keep < 1) {
+                keep = 1;
+            }
+            cleaned = base.substring(0, Math.min(base.length(), keep)) + ext;
+        }
+
+        return cleaned;
     }
 
     public static String cleanFilePath(String path) {
 
-        return !path.equals(".") ? ((System.getProperty("os.name").toLowerCase().contains("win") ? path.replaceAll("[<>:\"\\|\\?\\*\t]+", "") : path).replaceAll(" +\\" + File.separator, "\\" + File.separator).replaceAll("\\.\\.+", "__").replaceAll("[\\x00-\\x1F]", "").trim()) : path;
+        return !path.equals(".") ? ((IS_WINDOWS ? path.replaceAll("[<>:\"\\|\\?\\*\t]+", "") : path).replaceAll(" +\\" + File.separator, "\\" + File.separator).replaceAll("\\.\\.+", "__").replaceAll("[\\x00-\\x1F]", "").trim()) : path;
     }
 
     public static byte[] genRandomByteArray(int length) {
 
         byte[] the_array = new byte[length];
 
-        Random randomno = new Random();
-
-        randomno.nextBytes(the_array);
+        SECURE_RANDOM.nextBytes(the_array);
 
         return the_array;
     }
@@ -1060,7 +1205,7 @@ public class MiscTools {
 
                     try {
 
-                        String clean_data = MiscTools.newMegaLinks2Legacy(new String(Base64.getDecoder().decode(chunk)));
+                        String clean_data = MiscTools.newMegaLinks2Legacy(new String(Base64.getDecoder().decode(chunk), java.nio.charset.StandardCharsets.UTF_8));
 
                         String decoded = MiscTools.findFirstRegex("(?:https?|mega)://[^\r\n]+(#[^\r\n!]*?)?![^\r\n!]+![^\\?\r\n/]+", clean_data, 0);
 
@@ -1247,6 +1392,7 @@ public class MiscTools {
 
                 if (http_status != 200) {
                     http_error = http_status;
+                    drainAndCloseErrorStream(con);
                 } else {
                     http_error = 0;
                 }
@@ -1359,6 +1505,12 @@ public class MiscTools {
 
                 String latest_version = findFirstRegex("releases\\/tag\\/v?([0-9]+\\.[0-9]+)", latest_version_res, 1);
 
+                if (latest_version == null) {
+                    // GitHub page format changed; bail without crashing.
+                    Logger.getLogger(MiscTools.class.getName()).log(Level.FINE, "checkNewVersion: could not extract latest tag from response");
+                    return null;
+                }
+
                 new_version_major = findFirstRegex("([0-9]+)\\.[0-9]+", latest_version, 1);
 
                 new_version_minor = findFirstRegex("[0-9]+\\.([0-9]+)", latest_version, 1);
@@ -1367,7 +1519,9 @@ public class MiscTools {
 
                 current_version_minor = findFirstRegex("[0-9]+\\.([0-9]+)$", VERSION, 1);
 
-                if (new_version_major != null && (Integer.parseInt(current_version_major) < Integer.parseInt(new_version_major) || (Integer.parseInt(current_version_major) == Integer.parseInt(new_version_major) && Integer.parseInt(current_version_minor) < Integer.parseInt(new_version_minor)))) {
+                if (new_version_major != null && new_version_minor != null && current_version_major != null && current_version_minor != null
+                        && (Integer.parseInt(current_version_major) < Integer.parseInt(new_version_major)
+                        || (Integer.parseInt(current_version_major) == Integer.parseInt(new_version_major) && Integer.parseInt(current_version_minor) < Integer.parseInt(new_version_minor)))) {
 
                     return new_version_major + "." + new_version_minor;
 
@@ -1396,7 +1550,7 @@ public class MiscTools {
                     Desktop.getDesktop().browse(new URI(url));
                     return;
                 }
-                if (System.getProperty("os.name").toLowerCase().contains("nux")) {
+                if (System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT).contains("nux")) {
                     Process p = Runtime.getRuntime().exec(new String[]{"xdg-open", url});
                     p.waitFor();
                     p.destroy();
@@ -1444,20 +1598,21 @@ public class MiscTools {
 
     public static void restartApplication() {
 
-        StringBuilder cmd = new StringBuilder();
+        java.util.List<String> argv = new java.util.ArrayList<>();
 
-        cmd.append(System.getProperty("java.home")).append(File.separator).append("bin").append(File.separator).append("java ");
+        argv.add(System.getProperty("java.home") + File.separator + "bin" + File.separator + "java");
 
-        ManagementFactory.getRuntimeMXBean().getInputArguments().forEach((jvmArg) -> {
-            cmd.append(jvmArg).append(" ");
-        });
+        argv.addAll(ManagementFactory.getRuntimeMXBean().getInputArguments());
 
-        cmd.append("-cp ").append(ManagementFactory.getRuntimeMXBean().getClassPath()).append(" ");
+        argv.add("-cp");
+        argv.add(ManagementFactory.getRuntimeMXBean().getClassPath());
 
-        cmd.append(MainPanel.class.getName()).append(" native 1");
+        argv.add(MainPanel.class.getName());
+        argv.add("native");
+        argv.add("1");
 
         try {
-            Runtime.getRuntime().exec(cmd.toString());
+            new ProcessBuilder(argv).inheritIO().start();
         } catch (IOException ex) {
             Logger.getLogger(MiscTools.class.getName()).log(Level.SEVERE, ex.getMessage());
         }
@@ -1479,8 +1634,8 @@ public class MiscTools {
         }
 
         if (ignoreCase) {
-            a = a.toLowerCase();
-            b = b.toLowerCase();
+            a = a.toLowerCase(java.util.Locale.ROOT);
+            b = b.toLowerCase(java.util.Locale.ROOT);
         }
         int aLength = a.length();
         int bLength = b.length();
@@ -1572,9 +1727,9 @@ public class MiscTools {
 
                             pdialog.dispose();
 
-                            password_aes = Bin2BASE64(CryptTools.aes_cbc_decrypt_pkcs7(BASE642Bin((String) account_info.get("password_aes")), main_panel.getMaster_pass(), CryptTools.AES_ZERO_IV));
+                            password_aes = Bin2BASE64(CryptTools.aes_cbc_decrypt_at_rest(BASE642Bin((String) account_info.get("password_aes")), main_panel.getMaster_pass()));
 
-                            user_hash = Bin2BASE64(CryptTools.aes_cbc_decrypt_pkcs7(BASE642Bin((String) account_info.get("user_hash")), main_panel.getMaster_pass(), CryptTools.AES_ZERO_IV));
+                            user_hash = Bin2BASE64(CryptTools.aes_cbc_decrypt_at_rest(BASE642Bin((String) account_info.get("user_hash")), main_panel.getMaster_pass()));
 
                         } else {
 
@@ -1585,9 +1740,9 @@ public class MiscTools {
 
                     } else {
 
-                        password_aes = Bin2BASE64(CryptTools.aes_cbc_decrypt_pkcs7(BASE642Bin((String) account_info.get("password_aes")), main_panel.getMaster_pass(), CryptTools.AES_ZERO_IV));
+                        password_aes = Bin2BASE64(CryptTools.aes_cbc_decrypt_at_rest(BASE642Bin((String) account_info.get("password_aes")), main_panel.getMaster_pass()));
 
-                        user_hash = Bin2BASE64(CryptTools.aes_cbc_decrypt_pkcs7(BASE642Bin((String) account_info.get("user_hash")), main_panel.getMaster_pass(), CryptTools.AES_ZERO_IV));
+                        user_hash = Bin2BASE64(CryptTools.aes_cbc_decrypt_at_rest(BASE642Bin((String) account_info.get("user_hash")), main_panel.getMaster_pass()));
 
                     }
 
@@ -1612,7 +1767,7 @@ public class MiscTools {
 
                         if ((boolean) old_session_data.get("crypt")) {
 
-                            ByteArrayInputStream bs = new ByteArrayInputStream(CryptTools.aes_cbc_decrypt_pkcs7((byte[]) old_session_data.get("ma"), main_panel.getMaster_pass(), CryptTools.AES_ZERO_IV));
+                            ByteArrayInputStream bs = new ByteArrayInputStream(CryptTools.aes_cbc_decrypt_at_rest((byte[]) old_session_data.get("ma"), main_panel.getMaster_pass()));
 
                             try (ObjectInputStream is = new ObjectInputStream(bs)) {
 
@@ -1673,7 +1828,7 @@ public class MiscTools {
 
                         if (main_panel.getMaster_pass() != null) {
 
-                            DBTools.insertMegaSession(email, CryptTools.aes_cbc_encrypt_pkcs7(bs.toByteArray(), main_panel.getMaster_pass(), CryptTools.AES_ZERO_IV), true);
+                            DBTools.insertMegaSession(email, CryptTools.aes_cbc_encrypt_at_rest(bs.toByteArray(), main_panel.getMaster_pass()), true);
 
                         } else {
 

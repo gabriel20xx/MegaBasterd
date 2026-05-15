@@ -80,7 +80,7 @@ public class FolderLinkDialog extends javax.swing.JDialog {
         _total_space = 0L;
         _download = false;
         _download_links = new ArrayList<>();
-        _link = link;
+        _link = MiscTools.newMegaLinks2Legacy(link).trim();
 
         MiscTools.GUIRunAndWait(() -> {
 
@@ -483,6 +483,9 @@ public class FolderLinkDialog extends javax.swing.JDialog {
 
             int conta_nodo = 0;
 
+            int total_nodes = folder_nodes.size();
+            int progress_step = Math.max(1, total_nodes / 100);
+
             for (Object o : folder_nodes.values()) {
 
                 if (exit) {
@@ -491,11 +494,13 @@ public class FolderLinkDialog extends javax.swing.JDialog {
 
                 conta_nodo++;
 
-                int c = conta_nodo;
+                final int c = conta_nodo;
 
-                MiscTools.GUIRun(() -> {
-                    node_bar.setValue(c);
-                });
+                if (c == total_nodes || c % progress_step == 0) {
+                    MiscTools.GUIRun(() -> {
+                        node_bar.setValue(c);
+                    });
+                }
 
                 HashMap<String, Object> current_hashmap_node = (HashMap<String, Object>) o;
 

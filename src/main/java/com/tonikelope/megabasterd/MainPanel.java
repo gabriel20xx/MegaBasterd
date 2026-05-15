@@ -69,7 +69,7 @@ import javax.swing.UIManager;
  */
 public final class MainPanel {
 
-    public static final String VERSION = "8.22";
+    public static final String VERSION = "8.27";
     public static final boolean FORCE_SMART_PROXY = false; //TRUE FOR DEBUGING SMART PROXY
     public static final int THROTTLE_SLICE_SIZE = 16 * 1024;
     public static final int DEFAULT_BYTE_BUFFER_SIZE = 16 * 1024;
@@ -84,7 +84,25 @@ public final class MainPanel {
     public static final float ZOOM_FACTOR = 0.8f;
     public static final String DEFAULT_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64; rv:61.0) Gecko/20100101 Firefox/61.0";
     public static final String ICON_FILE = "/images/pica_roja_big.png";
-    public static final ExecutorService THREAD_POOL = newCachedThreadPool();
+    public static final ExecutorService THREAD_POOL = newCachedThreadPool(_megabasterdDaemonThreadFactory());
+
+    private static java.util.concurrent.ThreadFactory _megabasterdDaemonThreadFactory() {
+        return new java.util.concurrent.ThreadFactory() {
+            private final java.util.concurrent.atomic.AtomicLong counter = new java.util.concurrent.atomic.AtomicLong(1);
+
+            @Override
+            public Thread newThread(Runnable r) {
+                Thread t = new Thread(r, "MegaBasterd-Worker-" + counter.getAndIncrement());
+                // Daemon so the JVM can exit cleanly via System.exit even if a
+                // pool worker is still parked in secureWait. Non-daemon used to
+                // keep the JVM alive on shutdown when one of the long-running
+                // background loops (smart proxy refresh, memory monitor,
+                // watchdog accept) missed the _exit flag.
+                t.setDaemon(true);
+                return t;
+            }
+        };
+    }
     public static volatile String MEGABASTERD_HOME_DIR = System.getProperty("user.home");
     private static String _proxy_host;
     private static int _proxy_port;
@@ -96,7 +114,7 @@ public final class MainPanel {
     private static String _run_command_path;
     private static String _font;
     private static SmartMegaProxyManager _proxy_manager;
-    private static String _language;
+    private static volatile String _language;
     private static String _new_version;
     private static Boolean _resume_uploads;
     private static Boolean _resume_downloads;
@@ -143,6 +161,25 @@ public final class MainPanel {
         if ("yes".equals(DBTools.selectSettingValue("upload_log"))) {
             MiscTools.createUploadLogDir();
         }
+
+        // 8.27 migration: users who upgraded from pre-afb3936 builds (when
+        // VERIFY_CBC_MAC_DEFAULT was false) have "verify_down_file" = "no"
+        // persisted in their settings DB from any time they opened Settings
+        // and clicked Apply. Without this fix-up the 8.25 default-on never
+        // applied to them and corrupted downloads slipped through silently.
+        // Run once per install and remember it with a sentinel key.
+        try {
+            if (DBTools.selectSettingValue("verify_down_file_migrated_v827") == null) {
+                if ("no".equals(DBTools.selectSettingValue("verify_down_file"))) {
+                    DBTools.insertSettingValue("verify_down_file", "yes");
+                }
+                DBTools.insertSettingValue("verify_down_file_migrated_v827", "yes");
+            }
+        } catch (SQLException ex) {
+            Logger.getLogger(MainPanel.class.getName()).log(SEVERE, "verify_down_file migration failed", ex);
+        }
+
+        MiscTools.purgeOrphanThumbnails();
 
         final MainPanel main_panel = new MainPanel();
 
@@ -268,16 +305,43 @@ public final class MainPanel {
 
         if (_debug_file) {
 
-            PrintStream fileOut;
-
             try {
-                fileOut = new PrintStream(new FileOutputStream(MainPanel.MEGABASTERD_HOME_DIR + "/MEGABASTERD_DEBUG.log"));
+                String debug_path = MainPanel.MEGABASTERD_HOME_DIR + "/MEGABASTERD_DEBUG.log";
 
+                // 1) Redirect System.out / System.err so plain println / e.printStackTrace
+                //    output also lands in the debug file.
+                PrintStream fileOut = new PrintStream(new FileOutputStream(debug_path, true), true, "UTF-8");
                 System.setOut(fileOut);
                 System.setErr(fileOut);
 
-            } catch (FileNotFoundException ex) {
-                Logger.getLogger(MainPanel.class.getName()).log(Level.SEVERE, null, ex);
+                // 2) Install a java.util.logging FileHandler on the root logger.
+                //    Without this, JUL keeps writing to the ConsoleHandler that
+                //    cached System.err at JUL-init time -- which happened well
+                //    before the System.setErr() above. Result: pre-this-fix,
+                //    "Debug file" in Settings appeared to do nothing because
+                //    every LOG.log(...) call went to the original stderr (i.e.,
+                //    discarded on javaw / Windows).
+                java.util.logging.FileHandler fh = new java.util.logging.FileHandler(debug_path, true);
+                fh.setEncoding("UTF-8");
+                fh.setLevel(Level.ALL);
+                fh.setFormatter(new java.util.logging.SimpleFormatter());
+
+                java.util.logging.Logger root = java.util.logging.Logger.getLogger("");
+                root.setLevel(Level.ALL);
+                root.addHandler(fh);
+
+                // Lower the ConsoleHandler level so important stuff still shows
+                // on stdout for users running from a terminal.
+                for (java.util.logging.Handler h : root.getHandlers()) {
+                    if (h instanceof java.util.logging.ConsoleHandler) {
+                        h.setLevel(Level.INFO);
+                    }
+                }
+
+                Logger.getLogger(MainPanel.class.getName()).log(Level.INFO, "Debug log started -> {0}", debug_path);
+
+            } catch (IOException ex) {
+                Logger.getLogger(MainPanel.class.getName()).log(Level.SEVERE, "Failed to install debug log handler", ex);
             }
         }
 
@@ -379,16 +443,23 @@ public final class MainPanel {
 
         THREAD_POOL.execute(() -> {
             Runtime instance = Runtime.getRuntime();
-            while (true) {
+            String last_text = null;
+            while (!_exit) {
                 long used_memory = instance.totalMemory() - instance.freeMemory();
                 long max_memory = instance.maxMemory();
-                MiscTools.GUIRun(() -> {
-                    _view.getMemory_status().setText("JVM-RAM used: " + MiscTools.formatBytes(used_memory) + " / " + MiscTools.formatBytes(max_memory));
-                });
+                String text = "JVM-RAM used: " + MiscTools.formatBytes(used_memory) + " / " + MiscTools.formatBytes(max_memory);
+                // Skip setText if the rendered string is unchanged -- the EDT
+                // doesn't need a repaint event for "same value".
+                if (!text.equals(last_text)) {
+                    last_text = text;
+                    final String t = text;
+                    MiscTools.GUIRun(() -> _view.getMemory_status().setText(t));
+                }
                 try {
                     Thread.sleep(2000);
                 } catch (InterruptedException ex) {
-                    Logger.getLogger(MainPanelView.class.getName()).log(Level.SEVERE, ex.getMessage());
+                    Thread.currentThread().interrupt();
+                    return;
                 }
             }
         });
@@ -791,7 +862,7 @@ public final class MainPanel {
 
             String proxy_port = DBTools.selectSettingValue("proxy_port");
 
-            _proxy_port = (proxy_port == null || proxy_port.isEmpty()) ? 8080 : Integer.parseInt(proxy_port);
+            _proxy_port = MiscTools.parseIntOr(proxy_port, 8080);
 
             _proxy_user = DBTools.selectSettingValue("proxy_user");
 
@@ -825,7 +896,7 @@ public final class MainPanel {
 
             String reverse_port = DBTools.selectSettingValue("megacrypter_reverse_port");
 
-            _megacrypter_reverse_port = (reverse_port == null || reverse_port.isEmpty()) ? DEFAULT_MEGA_PROXY_PORT : Integer.parseInt(reverse_port);
+            _megacrypter_reverse_port = MiscTools.parseIntOr(reverse_port, DEFAULT_MEGA_PROXY_PORT);
         }
 
         String use_smart_proxy = selectSettingValue("smart_proxy");
@@ -868,7 +939,22 @@ public final class MainPanel {
 
             if (_run_command_path != null && !_run_command_path.equals("")) {
                 try {
-                    Runtime.getRuntime().exec(_run_command_path);
+                    String cmd = _run_command_path;
+                    java.io.File f = new java.io.File(cmd);
+                    java.util.List<String> argv;
+                    if (f.exists()) {
+                        // Treat the whole setting as a single binary path; this
+                        // makes "C:\Program Files\foo\bar.exe" work without the
+                        // old whitespace-split bug. If you need args, wrap in a
+                        // .bat/.sh script.
+                        argv = java.util.Collections.singletonList(cmd);
+                    } else {
+                        // Backwards-compat: command isn't a real file, fall back
+                        // to legacy whitespace-token splitting so existing
+                        // "command arg1 arg2" configs keep working.
+                        argv = java.util.Arrays.asList(cmd.trim().split("\\s+"));
+                    }
+                    new ProcessBuilder(argv).inheritIO().start();
                 } catch (IOException ex) {
                     Logger.getLogger(MainPanel.class.getName()).log(Level.SEVERE, ex.getMessage());
                 }
@@ -933,6 +1019,31 @@ public final class MainPanel {
                 Logger.getLogger(MainPanel.class.getName()).log(Level.SEVERE, ex.getMessage());
             }
 
+            // Close the shared SQLite connection cleanly so the WAL is
+            // checkpointed before process exit / restart. Without this the
+            // -wal / -shm sidecar files can linger and a restart can race
+            // a still-held file handle (worst on Windows).
+            try {
+                SqliteSingleton.getInstance().shutdown();
+            } catch (Exception ex) {
+                Logger.getLogger(MainPanel.class.getName()).log(Level.WARNING, "SqliteSingleton shutdown: {0}", ex.getMessage());
+            }
+
+            // Release the single-instance file lock so a restart can re-acquire
+            // it immediately (Windows file-sharing semantics can otherwise delay
+            // the new instance and make the user see "click restart, nothing
+            // happens").
+            try {
+                if (_single_instance_lock != null) {
+                    _single_instance_lock.release();
+                }
+                if (_single_instance_raf != null) {
+                    _single_instance_raf.close();
+                }
+            } catch (IOException ex) {
+                Logger.getLogger(MainPanel.class.getName()).log(Level.FINE, "Releasing single-instance lock: {0}", ex.getMessage());
+            }
+
             if (restart) {
                 restartApplication();
             } else {
@@ -948,6 +1059,14 @@ public final class MainPanel {
 
             if (delete_db) {
 
+                // Close the connection before deleting the file to avoid
+                // a Windows-shared-handle race.
+                try {
+                    SqliteSingleton.getInstance().shutdown();
+                } catch (Exception ex) {
+                    Logger.getLogger(MainPanel.class.getName()).log(Level.WARNING, "SqliteSingleton shutdown: {0}", ex.getMessage());
+                }
+
                 File db_file = new File(MainPanel.MEGABASTERD_HOME_DIR + "/.megabasterd" + MainPanel.VERSION + "/" + SqliteSingleton.SQLITE_FILE);
 
                 db_file.delete();
@@ -957,6 +1076,12 @@ public final class MainPanel {
                     DBTools.vaccum();
                 } catch (SQLException ex) {
                     Logger.getLogger(MainPanel.class.getName()).log(Level.SEVERE, ex.getMessage());
+                }
+
+                try {
+                    SqliteSingleton.getInstance().shutdown();
+                } catch (Exception ex) {
+                    Logger.getLogger(MainPanel.class.getName()).log(Level.WARNING, "SqliteSingleton shutdown: {0}", ex.getMessage());
                 }
             }
 
@@ -983,9 +1108,9 @@ public final class MainPanel {
 
                 String version_minor = findFirstRegex("[0-9]+\\.([0-9]+)$", VERSION, 1);
 
-                String old_version_major = null;
+                String old_version_major = "0";
 
-                String old_version_minor = null;
+                String old_version_minor = "0";
 
                 String old_version = "0.0";
 
@@ -1005,7 +1130,7 @@ public final class MainPanel {
                             if (current_dir_version != null && !current_dir_version.equals(VERSION)) {
 
                                 old_version_major = findFirstRegex("([0-9]+)\\.[0-9]+$", old_version, 1);
-                                old_version_major = findFirstRegex("[0-9]+\\.([0-9]+)$", old_version, 1);
+                                old_version_minor = findFirstRegex("[0-9]+\\.([0-9]+)$", old_version, 1);
 
                                 String current_dir_major = findFirstRegex("([0-9]+)\\.[0-9]+$", current_dir_version, 1);
                                 String current_dir_minor = findFirstRegex("[0-9]+\\.([0-9]+)$", current_dir_version, 1);
@@ -1190,47 +1315,80 @@ public final class MainPanel {
         }
     }
 
+    private static java.io.RandomAccessFile _single_instance_raf;
+    private static java.nio.channels.FileLock _single_instance_lock;
+
     private boolean checkAppIsRunning() {
 
-        boolean app_is_running = true;
-
+        // First, try to obtain an exclusive file lock on a per-user
+        // sentinel file. This is the canonical Java single-instance
+        // pattern and is immune to "some other process already bound
+        // port 1338" (see GH #717).
         try {
-            Socket clientSocket = new Socket(InetAddress.getLoopbackAddress(), WATCHDOG_PORT);
+            File lock_file = new File(MEGABASTERD_HOME_DIR + "/.megabasterd" + VERSION + "/.megabasterd.lock");
+            lock_file.getParentFile().mkdirs();
+            _single_instance_raf = new java.io.RandomAccessFile(lock_file, "rw");
+            _single_instance_lock = _single_instance_raf.getChannel().tryLock();
 
-            clientSocket.close();
-
+            if (_single_instance_lock == null) {
+                // Another MegaBasterd instance already holds the lock.
+                // Try to ping its watchdog so it pops to the foreground;
+                // if that fails because the port is taken by something
+                // else, no harm done -- still return "running".
+                _pingWatchdog();
+                try {
+                    _single_instance_raf.close();
+                } catch (IOException ignore) {
+                }
+                return true;
+            }
         } catch (Exception ex) {
+            Logger.getLogger(MainPanel.class.getName()).log(Level.WARNING, "Single-instance file lock failed: {0}", ex.getMessage());
+            // Fall through to start a watchdog listener if we can.
+        }
 
-            app_is_running = false;
-
+        // We are the only running instance. Spin up a watchdog listener
+        // so future invocations can ask us to come to the foreground.
+        // Try the configured port first, then a few alternates so a
+        // foreign process holding 1338 doesn't break us.
+        for (int port = WATCHDOG_PORT; port < WATCHDOG_PORT + 10; port++) {
             try {
-
-                final ServerSocket serverSocket = new ServerSocket(WATCHDOG_PORT, 0, InetAddress.getLoopbackAddress());
+                final ServerSocket serverSocket = new ServerSocket(port, 0, InetAddress.getLoopbackAddress());
 
                 THREAD_POOL.execute(() -> {
-                    final ServerSocket socket = serverSocket;
-                    while (true) {
+                    while (!serverSocket.isClosed()) {
                         try {
-                            socket.accept();
-                            MiscTools.GUIRun(() -> {
-                                getView().setExtendedState(NORMAL);
-
-                                getView().setVisible(true);
-                            });
-                        } catch (Exception ex1) {
-                            Logger.getLogger(MainPanel.class.getName()).log(Level.SEVERE, ex1.getMessage());
+                            try (Socket peer = serverSocket.accept()) {
+                                MiscTools.GUIRun(() -> {
+                                    getView().setExtendedState(NORMAL);
+                                    getView().setVisible(true);
+                                });
+                            }
+                        } catch (IOException ex1) {
+                            if (!serverSocket.isClosed()) {
+                                Logger.getLogger(MainPanel.class.getName()).log(Level.FINE, ex1.getMessage());
+                            }
+                            return;
                         }
                     }
                 });
-            } catch (Exception ex2) {
-
-                Logger.getLogger(MainPanel.class.getName()).log(Level.SEVERE, ex2.getMessage());
-
+                break;
+            } catch (Exception ex) {
+                Logger.getLogger(MainPanel.class.getName()).log(Level.FINE, "Watchdog port {0} busy, trying next", port);
             }
-
         }
 
-        return app_is_running;
+        return false;
+    }
+
+    private void _pingWatchdog() {
+        for (int port = WATCHDOG_PORT; port < WATCHDOG_PORT + 10; port++) {
+            try (Socket clientSocket = new Socket(InetAddress.getLoopbackAddress(), port)) {
+                return;
+            } catch (Exception ex) {
+                // try next port
+            }
+        }
     }
 
     public void resumeDownloads() {

@@ -50,9 +50,8 @@ public class DownloadManager extends TransferenceManager {
 
                 MiscTools.GUIRun(() -> {
                     getMain_panel().getView().getForce_chunk_reset_button().setEnabled(true);
+                    JOptionPane.showMessageDialog(getMain_panel().getView(), LabelTranslatorSingleton.getInstance().translate("CURRENT DOWNLOAD CHUNKS RESET!"));
                 });
-
-                JOptionPane.showMessageDialog(getMain_panel().getView(), LabelTranslatorSingleton.getInstance().translate("CURRENT DOWNLOAD CHUNKS RESET!"));
             }
 
         });
@@ -142,12 +141,11 @@ public class DownloadManager extends TransferenceManager {
     public void remove(Transference[] downloads) {
 
         ArrayList<String> delete_down = new ArrayList<>();
+        final java.util.ArrayList<DownloadView> views_to_remove = new java.util.ArrayList<>();
 
         for (final Transference d : downloads) {
 
-            MiscTools.GUIRun(() -> {
-                getScroll_panel().remove(((Download) d).getView());
-            });
+            views_to_remove.add(((Download) d).getView());
 
             getTransference_waitstart_queue().remove(d);
 
@@ -157,15 +155,25 @@ public class DownloadManager extends TransferenceManager {
 
             if (((Download) d).isProvision_ok()) {
 
-                increment_total_size(-1 * d.getFile_size());
-
-                increment_total_progress(-1 * d.getProgress());
-
-                if (!d.isCanceled() || d.isClosed()) {
-                    delete_down.add(((Download) d).getUrl());
-                }
+                ((Download) d).finalizeTotals();
             }
+
+            // Always remove the DB row when the user removes the transfer.
+            // The previous "!d.isCanceled() || d.isClosed()" gate AND the
+            // outer "if provision_ok" check let cancelled-but-not-closed and
+            // failed-to-provision downloads survive in the downloads table,
+            // so they kept being resurrected on every restart via
+            // resumeDownloads -> selectDownloads. Closes #699.
+            delete_down.add(((Download) d).getUrl());
         }
+
+        MiscTools.GUIRun(() -> {
+            for (DownloadView v : views_to_remove) {
+                getScroll_panel().remove(v);
+            }
+            getScroll_panel().revalidate();
+            getScroll_panel().repaint();
+        });
 
         try {
             deleteDownloads(delete_down.toArray(new String[delete_down.size()]));

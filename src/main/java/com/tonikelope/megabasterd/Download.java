@@ -55,7 +55,7 @@ import javax.swing.JComponent;
  */
 public class Download implements Transference, Runnable, SecureSingleThreadNotifiable {
 
-    public static final boolean VERIFY_CBC_MAC_DEFAULT = false;
+    public static final boolean VERIFY_CBC_MAC_DEFAULT = true;
     public static final boolean USE_SLOTS_DEFAULT = true;
     public static final int WORKERS_DEFAULT = 6;
     public static final boolean USE_MEGA_ACCOUNT_DOWN = false;
@@ -76,14 +76,14 @@ public class Download implements Transference, Runnable, SecureSingleThreadNotif
     private final String _url;
     private final String _download_path;
     private final String _custom_chunks_dir;
-    private String _file_name;
-    private String _file_key;
-    private Long _file_size;
-    private String _file_pass;
-    private String _file_noexpire;
+    private volatile String _file_name;
+    private volatile String _file_key;
+    private volatile Long _file_size;
+    private volatile String _file_pass;
+    private volatile String _file_noexpire;
     private volatile boolean _frozen;
     private final boolean _use_slots;
-    private int _slots;
+    private volatile int _slots;
     private final boolean _restart;
     private final ArrayList<ChunkDownloader> _chunkworkers;
     private final ExecutorService _thread_pool;
@@ -91,24 +91,25 @@ public class Download implements Transference, Runnable, SecureSingleThreadNotif
     private volatile boolean _pause;
     private final ConcurrentLinkedQueue<Long> _partialProgressQueue;
     private volatile long _progress;
-    private ChunkWriterManager _chunkmanager;
-    private String _last_download_url;
-    private boolean _provision_ok;
+    private volatile ChunkWriterManager _chunkmanager;
+    private volatile String _last_download_url;
+    private volatile boolean _provision_ok;
     private boolean _auto_retry_on_error;
-    private int _paused_workers;
+    private volatile int _paused_workers;
     private File _file;
     private boolean _checking_cbc;
     private boolean _retrying_request;
-    private Double _progress_bar_rate;
+    private volatile Double _progress_bar_rate;
     private OutputStream _output_stream;
     private String _status_error;
     private final ConcurrentLinkedQueue<Long> _rejectedChunkIds;
-    private long _last_chunk_id_dispatched;
+    private volatile long _last_chunk_id_dispatched;
     private final MegaAPI _ma;
     private volatile boolean _canceled;
     private volatile boolean _turbo;
     private volatile boolean _closed;
     private volatile boolean _finalizing;
+    private boolean _totals_finalized;
     private final Object _progress_watchdog_lock;
     private final boolean _priority;
     private volatile boolean global_cancel = false;
@@ -237,7 +238,7 @@ public class Download implements Transference, Runnable, SecureSingleThreadNotif
 
     public long calculateLastWrittenChunk(long temp_file_size) {
         if (temp_file_size > 3584 * 1024) {
-            return 7 + (long) Math.floor((float) (temp_file_size - 3584 * 1024) / (1024 * 1024 * (this.isUse_slots() ? Download.CHUNK_SIZE_MULTI : 1)));
+            return 7 + (long) Math.floor((double) (temp_file_size - 3584 * 1024) / (1024 * 1024 * (this.isUse_slots() ? Download.CHUNK_SIZE_MULTI : 1)));
         } else {
             long i = 0, tot = 0;
 
@@ -357,7 +358,7 @@ public class Download implements Transference, Runnable, SecureSingleThreadNotif
     public ArrayList<ChunkDownloader> getChunkworkers() {
 
         synchronized (_workers_lock) {
-            return _chunkworkers;
+            return new ArrayList<>(_chunkworkers);
         }
     }
 
@@ -537,12 +538,16 @@ public class Download implements Transference, Runnable, SecureSingleThreadNotif
 
         _closed = true;
 
-        if (_provision_ok) {
-            try {
-                deleteDownload(_url);
-            } catch (SQLException ex) {
-                LOG.log(SEVERE, null, ex);
-            }
+        // Always delete from DB when the user closes the row, regardless of
+        // whether the download ever successfully provisioned. Previously this
+        // was gated on _provision_ok, so a download that failed at provision
+        // (expired link, deleted file on MEGA, ...) stayed in the downloads
+        // table forever and got resurrected on every restart via
+        // resumeDownloads -> selectDownloads. Closes #699.
+        try {
+            deleteDownload(_url);
+        } catch (SQLException ex) {
+            LOG.log(SEVERE, null, ex);
         }
 
         _main_panel.getDownload_manager().getTransference_remove_queue().add(this);
@@ -599,7 +604,13 @@ public class Download implements Transference, Runnable, SecureSingleThreadNotif
                 if (!_file.exists() || _file.length() != _file_size) {
 
                     if (_file.exists()) {
-                        _file_name = _file_name.replaceFirst("\\..*$", "_" + MiscTools.genID(8) + "_$0");
+                        String suffix = "_" + MiscTools.genID(8);
+                        int dot = _file_name.lastIndexOf('.');
+                        if (dot > 0 && dot > _file_name.length() - 16) {
+                            _file_name = _file_name.substring(0, dot) + suffix + _file_name.substring(dot);
+                        } else {
+                            _file_name = _file_name + suffix;
+                        }
 
                         filename = _download_path + "/" + _file_name;
 
@@ -662,7 +673,8 @@ public class Download implements Transference, Runnable, SecureSingleThreadNotif
 
                                 _slots = getMain_panel().getDefault_slots_down();
 
-                                _view.getSlots_spinner().setValue(_slots);
+                                final int initial_slots = _slots;
+                                MiscTools.GUIRun(() -> _view.getSlots_spinner().setValue(initial_slots));
 
                                 for (int t = 1; t <= _slots; t++) {
                                     ChunkDownloader c = new ChunkDownloader(t, this);
@@ -796,7 +808,9 @@ public class Download implements Transference, Runnable, SecureSingleThreadNotif
 
                             String verify_file = selectSettingValue("verify_down_file");
 
-                            if (verify_file != null && verify_file.equals("yes")) {
+                            boolean do_verify = (verify_file == null) ? VERIFY_CBC_MAC_DEFAULT : verify_file.equals("yes");
+
+                            if (do_verify) {
                                 _checking_cbc = true;
 
                                 getView().printStatusNormal("Waiting to check file integrity...");
@@ -821,7 +835,13 @@ public class Download implements Transference, Runnable, SecureSingleThreadNotif
 
                                 } else if (!_exit) {
 
-                                    _status_error = "BAD NEWS :( File is DAMAGED!";
+                                    _status_error = "BAD NEWS :( File is DAMAGED! (deleted)";
+
+                                    try {
+                                        java.nio.file.Files.deleteIfExists(java.nio.file.Paths.get(filename));
+                                    } catch (IOException del_ex) {
+                                        LOG.log(Level.SEVERE, "Failed to delete corrupted file {0}: {1}", new Object[]{filename, del_ex.getMessage()});
+                                    }
 
                                     getView().printStatusError(_status_error);
 
@@ -920,6 +940,20 @@ public class Download implements Transference, Runnable, SecureSingleThreadNotif
             getView().printStatusError(_status_error);
 
             LOG.log(Level.SEVERE, ex.getMessage());
+        } finally {
+
+            if (_output_stream != null) {
+                try {
+                    _output_stream.close();
+                } catch (IOException close_ex) {
+                    LOG.log(Level.FINE, "Closing output stream on exit: {0}", close_ex.getMessage());
+                }
+            }
+
+            try {
+                getMain_panel().getGlobal_dl_speed().detachTransference(this);
+            } catch (Exception ignore) {
+            }
         }
 
         if (_file != null && !getView().isKeepTempFileSelected()) {
@@ -988,7 +1022,7 @@ public class Download implements Transference, Runnable, SecureSingleThreadNotif
                     try {
                         Thread.sleep(1000);
                     } catch (InterruptedException ex) {
-                        Logger.getLogger(Upload.class.getName()).log(Level.SEVERE, ex.getMessage());
+                        LOG.log(Level.SEVERE, ex.getMessage());
                     }
                 }
                 if (!_closed) {
@@ -1055,9 +1089,20 @@ public class Download implements Transference, Runnable, SecureSingleThreadNotif
                         _file_name = _file_name.replaceFirst("\\..*$", "_" + MiscTools.genID(8) + "_$0");
                     }
 
+                    if (_closed) {
+                        // User clicked Close while we were still provisioning.
+                        // Don't re-insert the row we're about to delete.
+                        return;
+                    }
+
                     try {
 
-                        insertDownload(_url, _ma.getFull_email(), _download_path, _file_name, _file_key, _file_size, _file_pass, _file_noexpire, _custom_chunks_dir);
+                        // Use returning-name variant: if insertDownload had to
+                        // pick a different filename to dodge UNIQUE(path,filename),
+                        // we MUST adopt that name -- otherwise the DB row and the
+                        // file we'll write to disk disagree and a sibling download
+                        // with the same display name clobbers the same .mctemp.
+                        _file_name = DBTools.insertDownloadReturningName(_url, _ma.getFull_email(), _download_path, _file_name, _file_key, _file_size, _file_pass, _file_noexpire, _custom_chunks_dir);
 
                         _provision_ok = true;
 
@@ -1079,12 +1124,17 @@ public class Download implements Transference, Runnable, SecureSingleThreadNotif
                     _file_name = _file_name.replaceFirst("\\..*$", "_" + MiscTools.genID(8) + "_$0");
                 }
 
+                if (_closed) {
+                    // User clicked Close while we were still provisioning.
+                    return;
+                }
+
                 //Resuming single file links and new/resuming folder links
                 try {
 
                     deleteDownload(_url); //If resuming
 
-                    insertDownload(_url, _ma.getFull_email(), _download_path, _file_name, _file_key, _file_size, _file_pass, _file_noexpire, _custom_chunks_dir);
+                    _file_name = DBTools.insertDownloadReturningName(_url, _ma.getFull_email(), _download_path, _file_name, _file_key, _file_size, _file_pass, _file_noexpire, _custom_chunks_dir);
 
                     _provision_ok = true;
 
@@ -1166,7 +1216,7 @@ public class Download implements Transference, Runnable, SecureSingleThreadNotif
 
         synchronized (_workers_lock) {
 
-            if (++_paused_workers == _chunkworkers.size() && !_exit) {
+            if (++_paused_workers >= _chunkworkers.size() && !_exit) {
 
                 getView().printStatusNormal("Download paused!");
 
@@ -1333,7 +1383,7 @@ public class Download implements Transference, Runnable, SecureSingleThreadNotif
                     getView().updateSlotsStatus();
                 }
 
-                if (!_exit && isPause() && _paused_workers == _chunkworkers.size()) {
+                if (!_exit && isPause() && _paused_workers >= _chunkworkers.size()) {
 
                     getView().printStatusNormal("Download paused!");
 
@@ -1699,7 +1749,9 @@ public class Download implements Transference, Runnable, SecureSingleThreadNotif
                     _secure_notify_lock.wait(1000);
                 } catch (InterruptedException ex) {
                     _exit = true;
-                    LOG.log(SEVERE, null, ex);
+                    Thread.currentThread().interrupt();
+                    LOG.log(Level.FINE, "secureWait interrupted");
+                    return;
                 }
             }
 
@@ -1712,11 +1764,19 @@ public class Download implements Transference, Runnable, SecureSingleThreadNotif
 
         synchronized (_progress_lock) {
 
+            if (_totals_finalized) {
+                return;
+            }
+
             long old_progress = _progress;
 
             _progress = progress;
 
             getMain_panel().getDownload_manager().increment_total_progress(_progress - old_progress);
+
+            if (_file_size == null || _file_size <= 0) {
+                return;
+            }
 
             int old_percent_progress = (int) Math.floor(((double) old_progress / _file_size) * 100);
 
@@ -1729,6 +1789,24 @@ public class Download implements Transference, Runnable, SecureSingleThreadNotif
             if (new_percent_progress > old_percent_progress) {
                 getView().updateProgressBar(_progress, _progress_bar_rate);
             }
+        }
+    }
+
+    public void finalizeTotals() {
+
+        synchronized (_progress_lock) {
+
+            if (_totals_finalized) {
+                return;
+            }
+
+            _totals_finalized = true;
+
+            if (_file_size != null) {
+                getMain_panel().getDownload_manager().increment_total_size(-_file_size);
+            }
+
+            getMain_panel().getDownload_manager().increment_total_progress(-_progress);
         }
     }
 

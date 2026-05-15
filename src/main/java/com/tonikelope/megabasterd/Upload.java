@@ -51,7 +51,7 @@ public class Upload implements Transference, Runnable, SecureSingleThreadNotifia
     private volatile String _thumbnail_file = "";
     private volatile boolean _exit;
     private volatile boolean _frozen;
-    private int _slots;
+    private volatile int _slots;
     private final Object _secure_notify_lock;
     private final Object _workers_lock;
     private final Object _chunkid_lock;
@@ -59,34 +59,35 @@ public class Upload implements Transference, Runnable, SecureSingleThreadNotifia
     private volatile long _progress;
     private byte[] _byte_file_iv;
     private final ConcurrentLinkedQueue<Long> _rejectedChunkIds;
-    private long _last_chunk_id_dispatched;
+    private volatile long _last_chunk_id_dispatched;
     private final ConcurrentLinkedQueue<Long> _partialProgressQueue;
     private final ExecutorService _thread_pool;
     private volatile int[] _file_meta_mac;
-    private String _fid;
+    private volatile String _fid;
     private volatile boolean _notified;
     private volatile String _completion_handler;
-    private int _paused_workers;
-    private Double _progress_bar_rate;
+    private volatile int _paused_workers;
+    private volatile Double _progress_bar_rate;
     private volatile boolean _pause;
     private final ArrayList<ChunkUploader> _chunkworkers;
-    private long _file_size;
-    private UploadMACGenerator _mac_generator;
+    private volatile long _file_size;
+    private volatile UploadMACGenerator _mac_generator;
     private boolean _create_dir;
-    private boolean _provision_ok;
+    private volatile boolean _provision_ok;
     private boolean _auto_retry_on_error;
-    private String _file_link;
+    private volatile String _file_link;
     private final MegaAPI _ma;
     private final String _file_name;
     private final String _parent_node;
     private int[] _ul_key;
-    private String _ul_url;
+    private volatile String _ul_url;
     private final String _root_node;
     private final byte[] _share_key;
     private final String _folder_link;
     private boolean _restart;
     private volatile boolean _closed;
     private volatile boolean _canceled;
+    private boolean _totals_finalized;
     private volatile String _temp_mac_data;
     private final boolean _priority;
     private final Object _progress_watchdog_lock;
@@ -253,7 +254,7 @@ public class Upload implements Transference, Runnable, SecureSingleThreadNotifia
     public ArrayList<ChunkUploader> getChunkworkers() {
 
         synchronized (_workers_lock) {
-            return _chunkworkers;
+            return new ArrayList<>(_chunkworkers);
         }
 
     }
@@ -377,7 +378,9 @@ public class Upload implements Transference, Runnable, SecureSingleThreadNotifia
                     _secure_notify_lock.wait(1000);
                 } catch (InterruptedException ex) {
                     _exit = true;
-                    LOG.log(Level.SEVERE, ex.getMessage());
+                    Thread.currentThread().interrupt();
+                    LOG.log(Level.FINE, "secureWait interrupted");
+                    return;
                 }
             }
 
@@ -550,12 +553,13 @@ public class Upload implements Transference, Runnable, SecureSingleThreadNotifia
 
         _closed = true;
 
-        if (_provision_ok) {
-            try {
-                DBTools.deleteUpload(_file_name, _ma.getFull_email());
-            } catch (SQLException ex) {
-                LOG.log(Level.SEVERE, ex.getMessage());
-            }
+        // Always delete from DB when the user closes the row -- same fix as
+        // Download.close(). Failed-to-provision uploads stuck in the uploads
+        // table forever otherwise. See #699.
+        try {
+            DBTools.deleteUpload(_file_name, _ma.getFull_email());
+        } catch (SQLException ex) {
+            LOG.log(Level.SEVERE, ex.getMessage());
         }
         _main_panel.getUpload_manager().getTransference_remove_queue().add(this);
 
@@ -803,7 +807,8 @@ public class Upload implements Transference, Runnable, SecureSingleThreadNotifia
 
                     _slots = getMain_panel().getDefault_slots_up();
 
-                    _view.getSlots_spinner().setValue(_slots);
+                    final int initial_slots = _slots;
+                    MiscTools.GUIRun(() -> _view.getSlots_spinner().setValue(initial_slots));
 
                     for (int t = 1; t <= _slots; t++) {
                         ChunkUploader c = new ChunkUploader(t, this);
@@ -849,7 +854,7 @@ public class Upload implements Transference, Runnable, SecureSingleThreadNotifia
                                 progress = getProgress();
                             } catch (InterruptedException ex) {
                                 progress = -1;
-                                Logger.getLogger(Download.class.getName()).log(Level.SEVERE, null, ex);
+                                LOG.log(Level.SEVERE, null, ex);
                             }
                         }
 
@@ -996,11 +1001,8 @@ public class Upload implements Transference, Runnable, SecureSingleThreadNotifia
 
                                     if (upload_log.exists()) {
 
-                                        FileWriter fr;
-                                        try {
-                                            fr = new FileWriter(upload_log, true);
+                                        try (java.io.OutputStreamWriter fr = new java.io.OutputStreamWriter(new java.io.FileOutputStream(upload_log, true), java.nio.charset.StandardCharsets.UTF_8)) {
                                             fr.write("[" + MiscTools.getFechaHoraActual() + "] " + _file_name + "   [" + MiscTools.formatBytes(_file_size) + "]   " + _file_link + "\n");
-                                            fr.close();
                                         } catch (IOException ex) {
                                             Logger.getLogger(Upload.class.getName()).log(Level.SEVERE, ex.getMessage());
                                         }
@@ -1152,6 +1154,15 @@ public class Upload implements Transference, Runnable, SecureSingleThreadNotifia
             _progress_watchdog_lock.notifyAll();
         }
 
+        // Defensive: if run() bailed out before the in-flow detach at the
+        // success path, drop the SpeedMeter reference so the failed upload
+        // does not pin the Transference (and its entire graph) until app
+        // exit.
+        try {
+            getMain_panel().getGlobal_up_speed().detachTransference(this);
+        } catch (Exception ignore) {
+        }
+
         LOG.log(Level.INFO, "{0} Uploader {1} BYE BYE", new Object[]{Thread.currentThread().getName(), this.getFile_name()});
     }
 
@@ -1206,7 +1217,7 @@ public class Upload implements Transference, Runnable, SecureSingleThreadNotifia
                     });
                 }
 
-                if (!_exit && isPause() && _paused_workers == _chunkworkers.size()) {
+                if (!_exit && isPause() && _paused_workers >= _chunkworkers.size()) {
 
                     getView().printStatusNormal("Upload paused!");
 
@@ -1276,11 +1287,19 @@ public class Upload implements Transference, Runnable, SecureSingleThreadNotifia
 
         synchronized (_progress_lock) {
 
+            if (_totals_finalized) {
+                return;
+            }
+
             long old_progress = _progress;
 
             _progress = progress;
 
             getMain_panel().getUpload_manager().increment_total_progress(_progress - old_progress);
+
+            if (_file_size <= 0) {
+                return;
+            }
 
             int old_percent_progress = (int) Math.floor(((double) old_progress / _file_size) * 100);
 
@@ -1297,6 +1316,22 @@ public class Upload implements Transference, Runnable, SecureSingleThreadNotifia
         }
     }
 
+    public void finalizeTotals() {
+
+        synchronized (_progress_lock) {
+
+            if (_totals_finalized) {
+                return;
+            }
+
+            _totals_finalized = true;
+
+            getMain_panel().getUpload_manager().increment_total_size(-_file_size);
+
+            getMain_panel().getUpload_manager().increment_total_progress(-_progress);
+        }
+    }
+
     @Override
     public boolean isStatusError() {
         return _status_error != null;
@@ -1305,7 +1340,7 @@ public class Upload implements Transference, Runnable, SecureSingleThreadNotifia
     public long calculateLastUploadedChunk(long bytes_read) {
 
         if (bytes_read > 3584 * 1024) {
-            return 7 + (long) Math.floor((float) (bytes_read - 3584 * 1024) / (1024 * 1024 * 1));
+            return 7 + (long) Math.floor((double) (bytes_read - 3584 * 1024) / (1024 * 1024));
         } else {
             long i = 0, tot = 0;
 

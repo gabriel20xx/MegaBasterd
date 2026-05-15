@@ -19,7 +19,6 @@ import java.nio.file.Paths;
 import java.security.InvalidAlgorithmParameterException;
 import java.security.InvalidKeyException;
 import java.security.NoSuchAlgorithmException;
-import java.util.concurrent.locks.ReentrantLock;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import javax.crypto.CipherInputStream;
@@ -32,8 +31,6 @@ import javax.crypto.NoSuchPaddingException;
 public class ChunkWriterManager implements Runnable, SecureSingleThreadNotifiable {
 
     private static final Logger LOG = Logger.getLogger(ChunkWriterManager.class.getName());
-
-    private static final ReentrantLock JOIN_CHUNKS_LOCK = new ReentrantLock();
 
     public static long calculateChunkOffset(long chunk_id, int size_multi) {
         long[] offs = {0, 128, 384, 768, 1280, 1920, 2688};
@@ -128,7 +125,9 @@ public class ChunkWriterManager implements Runnable, SecureSingleThreadNotifiabl
                     _secure_notify_lock.wait(1000);
                 } catch (InterruptedException ex) {
                     _exit = true;
-                    LOG.log(Level.SEVERE, ex.getMessage());
+                    Thread.currentThread().interrupt();
+                    LOG.log(Level.FINE, "secureWait interrupted");
+                    return;
                 }
             }
 
@@ -166,12 +165,15 @@ public class ChunkWriterManager implements Runnable, SecureSingleThreadNotifiabl
         _download.getMain_panel().getDownload_manager().getTransference_running_list().remove(_download);
         _download.getMain_panel().getDownload_manager().secureNotify();
         _download.getView().printStatusNormal("Download finished. Joining file chunks, please wait...");
-        _download.getView().getPause_button().setVisible(false);
         _download.getMain_panel().getGlobal_dl_speed().detachTransference(_download);
-        _download.getView().getSpeed_label().setVisible(false);
-        _download.getView().getSlots_label().setVisible(false);
-        _download.getView().getSlot_status_label().setVisible(false);
-        _download.getView().getSlots_spinner().setVisible(false);
+
+        MiscTools.GUIRun(() -> {
+            _download.getView().getPause_button().setVisible(false);
+            _download.getView().getSpeed_label().setVisible(false);
+            _download.getView().getSlots_label().setVisible(false);
+            _download.getView().getSlot_status_label().setVisible(false);
+            _download.getView().getSlots_spinner().setVisible(false);
+        });
 
     }
 
@@ -186,11 +188,6 @@ public class ChunkWriterManager implements Runnable, SecureSingleThreadNotifiabl
             try {
 
                 while (!_exit && (!_download.isStopped() || !_download.getChunkworkers().isEmpty()) && _bytes_written < _file_size) {
-
-                    if (!JOIN_CHUNKS_LOCK.isHeldByCurrentThread()) {
-                        LOG.log(Level.INFO, "{0} ChunkWriterManager: JOIN LOCK LOCKED FOR {1}", new Object[]{Thread.currentThread().getName(), _download.getFile_name()});
-                        JOIN_CHUNKS_LOCK.lock();
-                    }
 
                     if (!download_finished && _download.getProgress() == _file_size) {
 
@@ -234,7 +231,15 @@ public class ChunkWriterManager implements Runnable, SecureSingleThreadNotifiabl
 
                                 LOG.log(Level.INFO, "{0} ChunkWriterManager has written to disk chunk [{1}] {2} {3} {4}...", new Object[]{Thread.currentThread().getName(), _last_chunk_id_written, _bytes_written, _download.calculateLastWrittenChunk(_bytes_written), _download.getFile_name()});
 
-                                chunk_file.delete();
+                                if (!chunk_file.delete()) {
+                                    // Not fatal: _last_chunk_id_written has
+                                    // already advanced so the next loop iteration
+                                    // looks at .chunk{N+1} and won't re-read this
+                                    // file. The orphan will linger on disk but
+                                    // the output stream is correct.
+                                    LOG.log(Level.WARNING, "{0} ChunkWriterManager failed to delete consumed chunk file {1}",
+                                            new Object[]{Thread.currentThread().getName(), chunk_file});
+                                }
 
                                 chunk_file = new File(getChunks_dir() + "/" + MiscTools.HashString("sha1", _download.getUrl()) + ".chunk" + String.valueOf(_last_chunk_id_written + 1));
                             }
@@ -251,20 +256,13 @@ public class ChunkWriterManager implements Runnable, SecureSingleThreadNotifiabl
 
                         LOG.log(Level.INFO, "{0} ChunkWriterManager waiting for chunk [{1}] {2}...", new Object[]{Thread.currentThread().getName(), _last_chunk_id_written + 1, _download.getFile_name()});
 
-                        if (JOIN_CHUNKS_LOCK.isHeldByCurrentThread() && JOIN_CHUNKS_LOCK.isLocked()) {
-                            LOG.log(Level.INFO, "{0} ChunkWriterManager: JOIN LOCK RELEASED FOR {1}", new Object[]{Thread.currentThread().getName(), _download.getFile_name()});
-                            JOIN_CHUNKS_LOCK.unlock();
-                        }
-
                         secureWait();
                     }
                 }
 
-            } finally {
-                if (JOIN_CHUNKS_LOCK.isHeldByCurrentThread() && JOIN_CHUNKS_LOCK.isLocked()) {
-                    LOG.log(Level.INFO, "{0} ChunkWriterManager: JOIN LOCK RELEASED FOR {1}", new Object[]{Thread.currentThread().getName(), _download.getFile_name()});
-                    JOIN_CHUNKS_LOCK.unlock();
-                }
+            } catch (RuntimeException ex) {
+                LOG.log(Level.SEVERE, "{0} ChunkWriterManager unexpected error {1}", new Object[]{Thread.currentThread().getName(), ex.getMessage()});
+                throw ex;
             }
 
             if (_bytes_written == _file_size && MiscTools.isDirEmpty(Paths.get(getChunks_dir()))) {

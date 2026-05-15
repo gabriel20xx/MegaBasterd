@@ -44,6 +44,7 @@ public class KissVideoStreamServer implements HttpHandler, SecureSingleThreadNot
     public static final int THREAD_START = 0x01;
     public static final int THREAD_STOP = 0x02;
     public static final int DEFAULT_WORKERS = 10;
+    public static final int MAX_LINK_RETRIES = 20;
     private static final Logger LOG = Logger.getLogger(KissVideoStreamServer.class.getName());
 
     private final MainPanel _main_panel;
@@ -98,7 +99,9 @@ public class KissVideoStreamServer implements HttpHandler, SecureSingleThreadNot
                 try {
                     _secure_notify_lock.wait(1000);
                 } catch (InterruptedException ex) {
-                    LOG.log(SEVERE, null, ex);
+                    Thread.currentThread().interrupt();
+                    LOG.log(Level.FINE, "secureWait interrupted");
+                    return;
                 }
             }
 
@@ -147,7 +150,7 @@ public class KissVideoStreamServer implements HttpHandler, SecureSingleThreadNot
 
     }
 
-    private String[] _getMegaFileMetadata(String link, MainPanelView panel) throws IOException {
+    private String[] _getMegaFileMetadata(String link, MainPanelView panel) throws IOException, APIException {
 
         String[] file_info = null;
         int conta_error = 0;
@@ -173,15 +176,28 @@ public class KissVideoStreamServer implements HttpHandler, SecureSingleThreadNot
 
             } catch (APIException ex) {
 
+                int code = ex.getCode();
+
+                // Don't loop forever on fatal MEGA error codes (file deleted,
+                // taken down, blocked, etc.) -- propagate so the caller can
+                // surface a real error.
+                if (java.util.Arrays.asList(Transference.FATAL_API_ERROR_CODES).contains(code)) {
+                    throw ex;
+                }
+
                 error = true;
 
                 LOG.log(Level.SEVERE, ex.getMessage());
 
+                if (conta_error >= MAX_LINK_RETRIES) {
+                    throw ex;
+                }
+
                 try {
                     Thread.sleep(getWaitTimeExpBackOff(conta_error++) * 1000);
                 } catch (InterruptedException ex2) {
-                    LOG.log(Level.SEVERE, ex2.getMessage());
-
+                    Thread.currentThread().interrupt();
+                    return file_info;
                 }
 
             }
@@ -219,14 +235,25 @@ public class KissVideoStreamServer implements HttpHandler, SecureSingleThreadNot
 
             } catch (APIException ex) {
 
+                int code = ex.getCode();
+
+                if (java.util.Arrays.asList(Transference.FATAL_API_ERROR_CODES).contains(code)) {
+                    throw ex;
+                }
+
                 error = true;
 
                 LOG.log(Level.SEVERE, ex.getMessage());
 
+                if (conta_error >= MAX_LINK_RETRIES) {
+                    throw ex;
+                }
+
                 try {
                     Thread.sleep(getWaitTimeExpBackOff(conta_error++) * 1000);
                 } catch (InterruptedException ex2) {
-                    LOG.log(Level.SEVERE, ex2.getMessage());
+                    Thread.currentThread().interrupt();
+                    return dl_url;
                 }
 
             }
@@ -238,20 +265,45 @@ public class KissVideoStreamServer implements HttpHandler, SecureSingleThreadNot
 
     private long[] _parseRangeHeader(String header) {
 
-        Pattern pattern = Pattern.compile("bytes *\\= *([0-9]+) *\\- *([0-9]+)?");
+        // RFC 7233: "bytes=N-M", "bytes=N-" (open end), "bytes=-N" (suffix range).
+        Pattern pattern = Pattern.compile("bytes *= *([0-9]+)? *- *([0-9]+)?");
 
         Matcher matcher = pattern.matcher(header);
 
         long[] ranges = new long[2];
+        ranges[0] = -1;
+        ranges[1] = -1;
 
         if (matcher.find()) {
-            ranges[0] = Long.valueOf(matcher.group(1));
+            String start = matcher.group(1);
+            String end = matcher.group(2);
 
-            if (matcher.group(2) != null) {
-                ranges[1] = Long.valueOf(matcher.group(2));
-            } else {
-                ranges[1] = -1;
+            if (start != null) {
+                try {
+                    ranges[0] = Long.parseLong(start);
+                } catch (NumberFormatException ignore) {
+                }
             }
+
+            if (end != null) {
+                try {
+                    ranges[1] = Long.parseLong(end);
+                } catch (NumberFormatException ignore) {
+                }
+            }
+
+            // "bytes=-N" suffix range: caller (size known) interprets ranges[0]=-1
+            // as "last ranges[1] bytes". If absolutely no digits parsed, leave both
+            // as -1 so caller falls back to full content.
+            if (ranges[0] < 0 && ranges[1] < 0) {
+                ranges[0] = 0;
+            } else if (ranges[0] < 0) {
+                // suffix range placeholder; resolved by caller against content length
+            } else if (ranges[1] < 0) {
+                // open-ended: leave -1 so caller streams to EOF
+            }
+        } else {
+            ranges[0] = 0;
         }
 
         return ranges;
@@ -271,7 +323,7 @@ public class KissVideoStreamServer implements HttpHandler, SecureSingleThreadNot
 
         OutputStream os;
 
-        CipherInputStream cis;
+        CipherInputStream cis = null;
 
         String httpmethod = xchg.getRequestMethod();
 
@@ -417,6 +469,17 @@ public class KissVideoStreamServer implements HttpHandler, SecureSingleThreadNot
 
                     ranges = _parseRangeHeader(range_header);
 
+                    // Resolve RFC 7233 suffix range "bytes=-N" -> last N bytes.
+                    // _parseRangeHeader leaves ranges[0] = -1 in that case.
+                    if (ranges[0] < 0 && ranges[1] >= 0) {
+                        long suffix_len = Math.min(ranges[1], file_size);
+                        ranges[0] = file_size - suffix_len;
+                        ranges[1] = file_size - 1;
+                    } else if (ranges[0] < 0) {
+                        // Both -1 (parser error) -> treat as full content.
+                        ranges[0] = 0;
+                    }
+
                     sync_bytes = (int) ranges[0] % 16;
 
                     if (ranges[1] >= 0 && ranges[1] >= ranges[0]) {
@@ -478,7 +541,10 @@ public class KissVideoStreamServer implements HttpHandler, SecureSingleThreadNot
 
             if (chunkwriter != null) {
 
-                pipeout.close();
+                try {
+                    pipeout.close();
+                } catch (IOException ignore) {
+                }
 
                 chunkworkers.forEach((d) -> {
                     d.setExit(true);
@@ -487,6 +553,20 @@ public class KissVideoStreamServer implements HttpHandler, SecureSingleThreadNot
                 chunkwriter.setExit(true);
 
                 chunkwriter.secureNotifyAll();
+            }
+
+            if (cis != null) {
+                try {
+                    cis.close();
+                } catch (IOException ignore) {
+                }
+            }
+
+            if (pipein != null) {
+                try {
+                    pipein.close();
+                } catch (IOException ignore) {
+                }
             }
 
             xchg.close();

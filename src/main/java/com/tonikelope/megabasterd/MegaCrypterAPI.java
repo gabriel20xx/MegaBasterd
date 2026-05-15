@@ -77,7 +77,10 @@ public class MegaCrypterAPI {
             con.getOutputStream().close();
 
             if (con.getResponseCode() != 200) {
-                Logger.getLogger(MegaCrypterAPI.class.getName()).log(Level.INFO, "{0} Failed : HTTP error code : {1}", new Object[]{Thread.currentThread().getName(), con.getResponseCode()});
+                Logger.getLogger(MegaCrypterAPI.class.getName()).log(Level.WARNING, "{0} MegaCrypter HTTP {1} url={2}",
+                        new Object[]{Thread.currentThread().getName(), con.getResponseCode(), url_api.toString()});
+
+                MiscTools.drainAndCloseErrorStream(con);
 
             } else {
 
@@ -107,7 +110,8 @@ public class MegaCrypterAPI {
             }
 
         } catch (IOException ex) {
-            Logger.getLogger(MegaCrypterAPI.class.getName()).log(Level.SEVERE, ex.getMessage());
+            Logger.getLogger(MegaCrypterAPI.class.getName()).log(Level.SEVERE,
+                    Thread.currentThread().getName() + " MegaCrypter IOException url=" + url_api, ex);
         } finally {
 
             if (con != null) {
@@ -255,7 +259,20 @@ public class MegaCrypterAPI {
 
                     if ((password = pass_list.poll()) == null) {
 
-                        password = JOptionPane.showInputDialog(panel, "Enter password for MegaCrypter link:");
+                        // Show the modal password prompt OUTSIDE this lock would be
+                        // preferable, but we need the user's input before continuing
+                        // to validate. Run on EDT via invokeAndWait so that the modal
+                        // dialog's event loop is on the right thread; PASS_LOCK
+                        // remains held briefly.
+                        final String[] entered = {null};
+                        try {
+                            MiscTools.GUIRunAndWait(() -> {
+                                entered[0] = JOptionPane.showInputDialog(panel, "Enter password for MegaCrypter link:");
+                            });
+                        } catch (Exception ex) {
+                            // ignore
+                        }
+                        password = entered[0];
                     }
 
                     if (password != null) {
@@ -266,7 +283,7 @@ public class MegaCrypterAPI {
 
                             decrypter = genDecrypter("AES", "AES/CBC/PKCS5Padding", info_key, iv);
 
-                            bad_pass = !Arrays.equals(info_key, decrypter.doFinal(key_check));
+                            bad_pass = !java.security.MessageDigest.isEqual(info_key, decrypter.doFinal(key_check));
 
                             if (!bad_pass) {
 

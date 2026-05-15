@@ -11,8 +11,13 @@ package com.tonikelope.megabasterd;
 
 import static com.tonikelope.megabasterd.MiscTools.*;
 import java.io.*;
+import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.regex.Matcher;
@@ -29,10 +34,13 @@ public class MegaProxyServer implements Runnable {
 
     private static final Logger LOG = Logger.getLogger(MegaProxyServer.class.getName());
 
+    private static final int MAX_PROXY_THREADS = 64;
+
     private final String _password;
     private final int _port;
-    private ServerSocket _serverSocket;
+    private volatile ServerSocket _serverSocket;
     private final MainPanel _main_panel;
+    private volatile ExecutorService _handler_pool;
 
     public MegaProxyServer(MainPanel main_panel, String password, int port) {
 
@@ -40,6 +48,19 @@ public class MegaProxyServer implements Runnable {
         _password = password;
         _port = port;
 
+    }
+
+    private static ThreadFactory _daemonFactory(final String name_prefix) {
+        return new ThreadFactory() {
+            private final AtomicInteger counter = new AtomicInteger(1);
+
+            @Override
+            public Thread newThread(Runnable r) {
+                Thread t = new Thread(r, name_prefix + counter.getAndIncrement());
+                t.setDaemon(true);
+                return t;
+            }
+        };
     }
 
     public String getPassword() {
@@ -52,42 +73,64 @@ public class MegaProxyServer implements Runnable {
 
     public synchronized void stopServer() throws IOException {
 
-        _serverSocket.close();
+        if (_serverSocket != null) {
+            _serverSocket.close();
+        }
+
+        if (_handler_pool != null) {
+            _handler_pool.shutdownNow();
+        }
     }
 
     @Override
     public void run() {
 
+        _handler_pool = Executors.newFixedThreadPool(MAX_PROXY_THREADS, _daemonFactory("MegaProxyHandler-"));
+
         try {
 
-            _serverSocket = new ServerSocket(_port);
+            _serverSocket = new ServerSocket(_port, 50, InetAddress.getLoopbackAddress());
 
             Socket socket;
 
             try {
 
                 while ((socket = _serverSocket.accept()) != null) {
-                    (new Handler(socket, _password)).start();
+                    socket.setSoTimeout(30000);
+                    final Handler handler = new Handler(socket, _password, _handler_pool);
+                    try {
+                        _handler_pool.execute(handler);
+                    } catch (java.util.concurrent.RejectedExecutionException rex) {
+                        LOG.log(Level.WARNING, "MegaProxyServer rejected connection (pool saturated)");
+                        try {
+                            socket.close();
+                        } catch (IOException ignore) {
+                        }
+                    }
                 }
             } catch (IOException e) {
-
+                LOG.log(Level.FINE, "MegaProxyServer accept loop ended: {0}", e.getMessage());
             }
 
         } catch (IOException ex) {
             LOG.log(Level.SEVERE, ex.getMessage());
         } finally {
 
-            if (!_serverSocket.isClosed()) {
+            if (_serverSocket != null && !_serverSocket.isClosed()) {
                 try {
                     _serverSocket.close();
                 } catch (IOException ex) {
                     LOG.log(Level.SEVERE, ex.getMessage());
                 }
             }
+
+            if (_handler_pool != null) {
+                _handler_pool.shutdownNow();
+            }
         }
     }
 
-    public static class Handler extends Thread {
+    public static class Handler implements Runnable {
 
         public static final Pattern CONNECT_PATTERN = Pattern.compile("CONNECT (.*mega(?:\\.co)?\\.nz):(443) HTTP/(1\\.[01])", Pattern.CASE_INSENSITIVE);
         public static final Pattern AUTH_PATTERN = Pattern.compile("Proxy-Authorization: Basic +(.+)", Pattern.CASE_INSENSITIVE);
@@ -127,10 +170,25 @@ public class MegaProxyServer implements Runnable {
         private final Socket _clientSocket;
         private boolean _previousWasR = false;
         private final String _password;
+        private final ExecutorService _pool;
 
-        public Handler(Socket clientSocket, String password) {
+        public Handler(Socket clientSocket, String password, ExecutorService pool) {
             _clientSocket = clientSocket;
             _password = password;
+            _pool = pool;
+        }
+
+        private boolean _checkProxyAuth(String proxy_auth) {
+
+            int sep = proxy_auth.indexOf(':');
+            if (sep < 0) {
+                return false;
+            }
+
+            byte[] expected = _password.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            byte[] given = proxy_auth.substring(sep + 1).trim().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+
+            return java.security.MessageDigest.isEqual(expected, given);
         }
 
         @Override
@@ -138,7 +196,7 @@ public class MegaProxyServer implements Runnable {
             try {
                 String request = readLine(_clientSocket);
 
-                LOG.log(Level.INFO, request);
+                LOG.log(Level.FINE, request);
 
                 Matcher matcher = CONNECT_PATTERN.matcher(request);
 
@@ -158,13 +216,16 @@ public class MegaProxyServer implements Runnable {
 
                             proxy_auth = new String(BASE642Bin(matcher_auth.group(1).trim()), "UTF-8");
 
-                        }
+                            LOG.log(Level.FINE, "Proxy-Authorization: [REDACTED]");
 
-                        LOG.log(Level.INFO, header);
+                        } else {
+
+                            LOG.log(Level.FINE, header);
+                        }
 
                     } while (!"".equals(header));
 
-                    if (proxy_auth != null && proxy_auth.matches(".*?: *?" + _password)) {
+                    if (proxy_auth != null && _checkProxyAuth(proxy_auth)) {
                         final Socket forwardSocket;
 
                         try {
@@ -184,12 +245,17 @@ public class MegaProxyServer implements Runnable {
                             outputStreamWriter.write("\r\n");
                             outputStreamWriter.flush();
 
-                            Thread remoteToClient = new Thread() {
-                                @Override
-                                public void run() {
-                                    forwardData(forwardSocket, _clientSocket);
-                                }
-                            };
+                            // Dedicated daemon thread for the remote->client direction.
+                            // Previously this submitted to _pool and blocked .get() on it;
+                            // with a bounded pool (64 threads) that meant each Handler
+                            // occupied 2 pool slots and saturated at 32 concurrent
+                            // connections -- and beyond that, every new connection
+                            // deadlocked because the Handler held one slot, queued its
+                            // remoteToClient, and blocked waiting for a slot that would
+                            // never come free until SO_TIMEOUT fired.
+                            final Thread remoteToClient = new Thread(() -> forwardData(forwardSocket, _clientSocket),
+                                    "MegaProxyHandler-remote-" + _clientSocket.getRemoteSocketAddress());
+                            remoteToClient.setDaemon(true);
                             remoteToClient.start();
                             try {
                                 if (_previousWasR) {
@@ -213,8 +279,8 @@ public class MegaProxyServer implements Runnable {
                             } finally {
                                 try {
                                     remoteToClient.join();
-                                } catch (InterruptedException e) {
-
+                                } catch (InterruptedException ie) {
+                                    Thread.currentThread().interrupt();
                                 }
                             }
                         } finally {

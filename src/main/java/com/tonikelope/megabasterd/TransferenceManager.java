@@ -228,7 +228,9 @@ abstract public class TransferenceManager implements Runnable, SecureSingleThrea
                 try {
                     _secure_notify_lock.wait(1000);
                 } catch (InterruptedException ex) {
-                    LOG.log(Level.SEVERE, ex.getMessage());
+                    Thread.currentThread().interrupt();
+                    LOG.log(Level.FINE, "secureWait interrupted");
+                    return;
                 }
             }
 
@@ -350,6 +352,32 @@ abstract public class TransferenceManager implements Runnable, SecureSingleThrea
         secureNotify();
     }
 
+    private void _reorderScrollPanel() {
+
+        ArrayList<Transference> desired = new ArrayList<>(getTransference_waitstart_queue());
+        desired.addAll(getTransference_finished_queue());
+
+        MiscTools.GUIRun(() -> {
+            Component panel = (Component) getScroll_panel();
+            if (panel == null) {
+                return;
+            }
+            int z = 0;
+            for (Transference t : desired) {
+                Component view = (Component) t.getView();
+                if (view != null && view.getParent() == getScroll_panel() && z < getScroll_panel().getComponentCount()) {
+                    try {
+                        getScroll_panel().setComponentZOrder(view, z);
+                    } catch (IllegalArgumentException ignore) {
+                    }
+                    z++;
+                }
+            }
+            getScroll_panel().revalidate();
+            getScroll_panel().repaint();
+        });
+    }
+
     public void topWaitQueue(Transference t) {
 
         synchronized (getWait_queue_lock()) {
@@ -369,18 +397,7 @@ abstract public class TransferenceManager implements Runnable, SecureSingleThrea
 
             getTransference_waitstart_queue().addAll(wait_array);
 
-            getTransference_waitstart_queue().forEach((t1) -> {
-                MiscTools.GUIRun(() -> {
-                    getScroll_panel().remove((Component) t1.getView());
-                    getScroll_panel().add((Component) t1.getView());
-                });
-            });
-            getTransference_finished_queue().forEach((t1) -> {
-                MiscTools.GUIRun(() -> {
-                    getScroll_panel().remove((Component) t1.getView());
-                    getScroll_panel().add((Component) t1.getView());
-                });
-            });
+            _reorderScrollPanel();
         }
 
         secureNotify();
@@ -405,18 +422,7 @@ abstract public class TransferenceManager implements Runnable, SecureSingleThrea
 
             getTransference_waitstart_queue().addAll(wait_array);
 
-            getTransference_waitstart_queue().forEach((t1) -> {
-                MiscTools.GUIRun(() -> {
-                    getScroll_panel().remove((Component) t1.getView());
-                    getScroll_panel().add((Component) t1.getView());
-                });
-            });
-            getTransference_finished_queue().forEach((t1) -> {
-                MiscTools.GUIRun(() -> {
-                    getScroll_panel().remove((Component) t1.getView());
-                    getScroll_panel().add((Component) t1.getView());
-                });
-            });
+            _reorderScrollPanel();
         }
 
         secureNotify();
@@ -448,18 +454,7 @@ abstract public class TransferenceManager implements Runnable, SecureSingleThrea
 
             getTransference_waitstart_queue().addAll(wait_array);
 
-            getTransference_waitstart_queue().forEach((t1) -> {
-                MiscTools.GUIRun(() -> {
-                    getScroll_panel().remove((Component) t1.getView());
-                    getScroll_panel().add((Component) t1.getView());
-                });
-            });
-            getTransference_finished_queue().forEach((t1) -> {
-                MiscTools.GUIRun(() -> {
-                    getScroll_panel().remove((Component) t1.getView());
-                    getScroll_panel().add((Component) t1.getView());
-                });
-            });
+            _reorderScrollPanel();
         }
 
         secureNotify();
@@ -491,18 +486,7 @@ abstract public class TransferenceManager implements Runnable, SecureSingleThrea
 
             getTransference_waitstart_queue().addAll(wait_array);
 
-            getTransference_waitstart_queue().forEach((t1) -> {
-                MiscTools.GUIRun(() -> {
-                    getScroll_panel().remove((Component) t1.getView());
-                    getScroll_panel().add((Component) t1.getView());
-                });
-            });
-            getTransference_finished_queue().forEach((t2) -> {
-                MiscTools.GUIRun(() -> {
-                    getScroll_panel().remove((Component) t2.getView());
-                    getScroll_panel().add((Component) t2.getView());
-                });
-            });
+            _reorderScrollPanel();
         }
 
         secureNotify();
@@ -685,15 +669,26 @@ abstract public class TransferenceManager implements Runnable, SecureSingleThrea
 
             _main_panel.getView().getUnfreeze_transferences_button().setVisible(_main_panel.getDownload_manager().hasFrozenTransferences() || _main_panel.getUpload_manager().hasFrozenTransferences());
 
-            _main_panel.getView().revalidate();
-
-            _main_panel.getView().repaint();
+            // Do NOT revalidate+repaint the scroll panel here. _updateView fires
+            // on every secureNotify -- which means every chunk completion, every
+            // provision, every progress tick. With N rows in BoxLayout, a full
+            // revalidate is O(N) layout work; aggregated this was the dominant
+            // EDT cost. The mutating helpers (topWaitQueue, bottomWaitQueue,
+            // remove, provision, _reorderScrollPanel) already revalidate the
+            // scroll panel themselves when they actually change child layout;
+            // _updateView only changes the status labels and toolbar buttons,
+            // which don't need a viewport relayout.
         });
     }
 
     private String _genStatus() {
 
-        int pre = _transference_preprocess_global_queue.size();
+        // Both preprocess queues count for "still in progress": _global_queue
+        // holds the user-level link/file items, _preprocess_queue holds the
+        // worker Runnables. Status bar (line ~642) checks both; this used
+        // to only check _global_queue, so the "all finished" notification
+        // fired while a preprocess Runnable was still pending. Closes #434.
+        int pre = _transference_preprocess_global_queue.size() + _transference_preprocess_queue.size();
 
         int prov = _transference_provision_queue.size();
 
@@ -885,21 +880,9 @@ abstract public class TransferenceManager implements Runnable, SecureSingleThrea
 
                         getTransference_waitstart_aux_queue().clear();
 
-                        getTransference_waitstart_queue().forEach((t) -> {
-                            MiscTools.GUIRun(() -> {
-                                getScroll_panel().remove((Component) t.getView());
-                                getScroll_panel().add((Component) t.getView());
-                            });
-                        });
-
                         sortTransferenceQueue(getTransference_finished_queue());
 
-                        getTransference_finished_queue().forEach((t) -> {
-                            MiscTools.GUIRun(() -> {
-                                getScroll_panel().remove((Component) t.getView());
-                                getScroll_panel().add((Component) t.getView());
-                            });
-                        });
+                        _reorderScrollPanel();
 
                     }
 
@@ -925,15 +908,27 @@ abstract public class TransferenceManager implements Runnable, SecureSingleThrea
                                 transference = getTransference_waitstart_aux_queue().peek();
                             }
 
-                            if (transference != null && !transference.isFrozen()) {
-
-                                getTransference_waitstart_queue().remove(transference);
-
-                                getTransference_waitstart_aux_queue().remove(transference);
-
-                                start(transference);
-
+                            if (transference == null) {
+                                // Both queues raced empty since the outer check; nothing to do.
+                                break;
                             }
+
+                            if (transference.isFrozen()) {
+                                // Head is frozen and we can't dequeue it (would lose state).
+                                // Without this break the outer `while` spins forever holding +
+                                // releasing _transference_queue_sort_lock thousands of times per
+                                // second, pinning a thread at 100% CPU and blocking the
+                                // provisioning task that also wants this lock. secureWait at
+                                // the bottom of run() will re-trigger us when the user
+                                // unfreezes.
+                                break;
+                            }
+
+                            getTransference_waitstart_queue().remove(transference);
+
+                            getTransference_waitstart_aux_queue().remove(transference);
+
+                            start(transference);
                         }
                     }
 

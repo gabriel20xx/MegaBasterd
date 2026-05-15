@@ -129,7 +129,9 @@ public class ChunkDownloader implements Runnable, SecureSingleThreadNotifiable {
                     _secure_notify_lock.wait(1000);
                 } catch (InterruptedException ex) {
                     _exit = true;
-                    LOG.log(Level.SEVERE, ex.getMessage());
+                    Thread.currentThread().interrupt();
+                    LOG.log(Level.FINE, "secureWait interrupted");
+                    return;
                 }
             }
 
@@ -316,6 +318,8 @@ public class ChunkDownloader implements Runnable, SecureSingleThreadNotifiable {
 
                             http_error = http_status;
 
+                            MiscTools.drainAndCloseErrorStream(con);
+
                         } else {
 
                             chunk_file = new File(_download.getChunkmanager().getChunks_dir() + "/" + MiscTools.HashString("sha1", _download.getUrl()) + ".chunk" + chunk_id);
@@ -371,16 +375,28 @@ public class ChunkDownloader implements Runnable, SecureSingleThreadNotifiable {
 
                             LOG.log(Level.INFO, "{0} Worker [{1}] has OK DOWNLOADED (" + (_current_smart_proxy != null ? "smartproxy" : "direct") + ") chunk [{2}]! {3}", new Object[]{Thread.currentThread().getName(), _id, chunk_id, _download.getFile_name()});
 
+                            boolean rename_failed = false;
+
                             if (tmp_chunk_file != null && chunk_file != null && (!chunk_file.exists() || chunk_file.length() != chunk_size)) {
 
-                                if (chunk_file.exists()) {
-                                    chunk_file.delete();
+                                if (chunk_file.exists() && !chunk_file.delete()) {
+                                    LOG.log(Level.WARNING, "{0} Worker [{1}] failed to delete pre-existing chunk file {2}",
+                                            new Object[]{Thread.currentThread().getName(), _id, chunk_file});
                                 }
 
-                                tmp_chunk_file.renameTo(chunk_file);
+                                if (!tmp_chunk_file.renameTo(chunk_file)) {
+                                    // Rename can fail in Windows when an antivirus has the .tmp
+                                    // open or the destination is locked. Without surfacing this,
+                                    // ChunkWriterManager would wait forever for .chunk{N} and the
+                                    // slot would freeze (see #706 / #684). Mark the chunk as
+                                    // failed so it gets requeued.
+                                    LOG.log(Level.WARNING, "{0} Worker [{1}] failed to rename {2} -> {3}; requeueing chunk",
+                                            new Object[]{Thread.currentThread().getName(), _id, tmp_chunk_file, chunk_file});
+                                    rename_failed = true;
+                                }
                             }
 
-                            chunk_error = false;
+                            chunk_error = rename_failed;
 
                             conta_error = 0;
 

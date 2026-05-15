@@ -189,21 +189,65 @@ public class DBTools {
     }
 
     public static synchronized void insertDownload(String url, String email, String path, String filename, String filekey, Long size, String filepass, String filenoexpire, String custom_chunks_dir) throws SQLException {
+        // Wrapper kept for callers that don't care about the chosen filename.
+        insertDownloadReturningName(url, email, path, filename, filekey, size, filepass, filenoexpire, custom_chunks_dir);
+    }
 
-        try (Connection conn = SqliteSingleton.getInstance().getConn(); PreparedStatement ps = conn.prepareStatement("INSERT INTO downloads (url, email, path, filename, filekey, filesize, filepass, filenoexpire, custom_chunks_dir) VALUES (?,?,?,?,?,?,?,?,?)")) {
+    /**
+     * Variant that returns the filename actually persisted to DB. When the
+     * UNIQUE(path, filename) constraint trips (two MEGA files with the same
+     * display name to the same dir), retries up to 50 times appending a
+     * random suffix. Caller MUST use the returned name when computing the
+     * on-disk path -- otherwise the DB row and the file written to disk
+     * disagree and two concurrent downloads clobber the same .mctemp. #719.
+     */
+    public static synchronized String insertDownloadReturningName(String url, String email, String path, String filename, String filekey, Long size, String filepass, String filenoexpire, String custom_chunks_dir) throws SQLException {
 
-            ps.setString(1, url);
-            ps.setString(2, email);
-            ps.setString(3, path);
-            ps.setString(4, filename);
-            ps.setString(5, filekey);
-            ps.setLong(6, size);
-            ps.setString(7, filepass);
-            ps.setString(8, filenoexpire);
-            ps.setString(9, custom_chunks_dir);
+        SQLException last_ex = null;
 
-            ps.executeUpdate();
+        for (int attempt = 0; attempt < 50; attempt++) {
+
+            String candidate_name = (attempt == 0) ? filename : _appendSuffix(filename, "_" + MiscTools.genID(6));
+
+            try (Connection conn = SqliteSingleton.getInstance().getConn(); PreparedStatement ps = conn.prepareStatement("INSERT INTO downloads (url, email, path, filename, filekey, filesize, filepass, filenoexpire, custom_chunks_dir) VALUES (?,?,?,?,?,?,?,?,?)")) {
+
+                ps.setString(1, url);
+                ps.setString(2, email);
+                ps.setString(3, path);
+                ps.setString(4, candidate_name);
+                ps.setString(5, filekey);
+                ps.setLong(6, size);
+                ps.setString(7, filepass);
+                ps.setString(8, filenoexpire);
+                ps.setString(9, custom_chunks_dir);
+
+                ps.executeUpdate();
+                return candidate_name;
+
+            } catch (SQLException ex) {
+                last_ex = ex;
+                String msg = ex.getMessage() == null ? "" : ex.getMessage().toLowerCase();
+                if (!msg.contains("unique") && !msg.contains("constraint")) {
+                    throw ex;
+                }
+                Logger.getLogger(DBTools.class.getName()).log(Level.INFO, "insertDownload UNIQUE collision on {0}, retrying with suffix", candidate_name);
+            }
         }
+
+        throw last_ex != null ? last_ex : new SQLException("insertDownload exhausted retries");
+    }
+
+    private static String _appendSuffix(String filename, String suffix) {
+        if (filename == null) {
+            return suffix;
+        }
+        int dot = filename.lastIndexOf('.');
+        // Only treat as extension if the dot is in the last 16 chars and not
+        // at position 0 (hidden file).
+        if (dot > 0 && dot > filename.length() - 16) {
+            return filename.substring(0, dot) + suffix + filename.substring(dot);
+        }
+        return filename + suffix;
     }
 
     public static synchronized void deleteDownload(String url) throws SQLException {

@@ -53,7 +53,13 @@ public final class SmartMegaProxyManager {
     private static final Logger LOG = Logger.getLogger(SmartMegaProxyManager.class.getName());
     private volatile String _proxy_list_url;
     private final ConcurrentHashMap<String, Long[]> _proxy_list;
-    private static final HashMap<String, String> PROXY_LIST_AUTH = new HashMap<>();
+    // ConcurrentHashMap (not HashMap): the Authenticator.getPasswordAuthentication
+    // callback at SmartProxyAuthenticator.getPasswordAuthentication() runs on
+    // arbitrary JDK HTTP/SOCKS connection threads, with no shared monitor with
+    // refreshProxyList() which clears+repopulates this map. Plain HashMap under
+    // concurrent structural mutation (clear+put) can NPE on resize and stall
+    // the connection thread.
+    private static final ConcurrentHashMap<String, String> PROXY_LIST_AUTH = new ConcurrentHashMap<>();
     private static final ConcurrentHashMap<String, Ikev2Credentials> IKEV2_AUTH = new ConcurrentHashMap<>();
     private static final ConcurrentHashMap<String, WireguardConfig> WIREGUARD_CONFIGS = new ConcurrentHashMap<>();
     private final MainPanel _main_panel;
@@ -137,19 +143,11 @@ public final class SmartMegaProxyManager {
     public synchronized void refreshSmartProxySettings() {
         String smartproxy_ban_time = DBTools.selectSettingValue("smartproxy_ban_time");
 
-        if (smartproxy_ban_time != null) {
-            _ban_time = Integer.parseInt(smartproxy_ban_time);
-        } else {
-            _ban_time = PROXY_BLOCK_TIME;
-        }
+        _ban_time = MiscTools.parseIntOr(smartproxy_ban_time, PROXY_BLOCK_TIME);
 
         String smartproxy_timeout = DBTools.selectSettingValue("smartproxy_timeout");
 
-        if (smartproxy_timeout != null) {
-            _proxy_timeout = Integer.parseInt(smartproxy_timeout) * 1000;
-        } else {
-            _proxy_timeout = Transference.HTTP_PROXY_TIMEOUT;
-        }
+        _proxy_timeout = MiscTools.parseIntOr(smartproxy_timeout, Transference.HTTP_PROXY_TIMEOUT / 1000) * 1000;
 
         String force_smart_proxy_string = DBTools.selectSettingValue("force_smart_proxy");
 
@@ -162,11 +160,7 @@ public final class SmartMegaProxyManager {
 
         String autorefresh_smart_proxy_string = DBTools.selectSettingValue("smartproxy_autorefresh_time");
 
-        if (autorefresh_smart_proxy_string != null) {
-            _autorefresh_time = Integer.parseInt(autorefresh_smart_proxy_string);
-        } else {
-            _autorefresh_time = PROXY_AUTO_REFRESH_TIME;
-        }
+        _autorefresh_time = MiscTools.parseIntOr(autorefresh_smart_proxy_string, PROXY_AUTO_REFRESH_TIME);
 
         String reset_slot_proxy = DBTools.selectSettingValue("reset_slot_proxy");
 
@@ -818,24 +812,39 @@ public final class SmartMegaProxyManager {
 
                 URL url = new URL(this._proxy_list_url);
 
+                if (!"https".equalsIgnoreCase(url.getProtocol())) {
+                    LOG.log(Level.WARNING, "Smart proxy list URL is not HTTPS ({0}); response is unauthenticated and could be MITM'd", url.toString());
+                }
+
                 con = (HttpURLConnection) url.openConnection();
 
                 con.setUseCaches(false);
 
                 con.setRequestProperty("User-Agent", MainPanel.DEFAULT_USER_AGENT);
 
-                try (InputStream is = con.getInputStream(); ByteArrayOutputStream byte_res = new ByteArrayOutputStream()) {
+                if (con.getResponseCode() != 200) {
 
-                    byte[] buffer = new byte[MainPanel.DEFAULT_BYTE_BUFFER_SIZE];
+                    LOG.log(Level.WARNING, "Smart proxy list fetch failed: HTTP {0}", con.getResponseCode());
 
-                    int reads;
+                    MiscTools.drainAndCloseErrorStream(con);
 
-                    while ((reads = is.read(buffer)) != -1) {
+                    data = "";
 
-                        byte_res.write(buffer, 0, reads);
+                } else {
+
+                    try (InputStream is = con.getInputStream(); ByteArrayOutputStream byte_res = new ByteArrayOutputStream()) {
+
+                        byte[] buffer = new byte[MainPanel.DEFAULT_BYTE_BUFFER_SIZE];
+
+                        int reads;
+
+                        while ((reads = is.read(buffer)) != -1) {
+
+                            byte_res.write(buffer, 0, reads);
+                        }
+
+                        data = new String(byte_res.toByteArray(), "UTF-8");
                     }
-
-                    data = new String(byte_res.toByteArray(), "UTF-8");
                 }
 
                 String[] proxy_list = data.split("\n");

@@ -86,7 +86,9 @@ public class ChunkUploader implements Runnable, SecureSingleThreadNotifiable {
                     _secure_notify_lock.wait(1000);
                 } catch (InterruptedException ex) {
                     _exit = true;
-                    LOG.log(Level.SEVERE, ex.getMessage());
+                    Thread.currentThread().interrupt();
+                    LOG.log(Level.FINE, "secureWait interrupted");
+                    return;
                 }
             }
 
@@ -104,6 +106,11 @@ public class ChunkUploader implements Runnable, SecureSingleThreadNotifiable {
 
     public Upload getUpload() {
         return _upload;
+    }
+
+    private static RandomAccessFile _seek(RandomAccessFile f, long offset) throws IOException {
+        f.seek(offset);
+        return f;
     }
 
     public void setError_wait(boolean error_wait) {
@@ -194,13 +201,9 @@ public class ChunkUploader implements Runnable, SecureSingleThreadNotifiable {
 
                     if (!_exit) {
 
-                        RandomAccessFile f = new RandomAccessFile(_upload.getFile_name(), "r");
-
-                        f.seek(chunk_offset);
-
                         ByteArrayOutputStream chunk_mac = new ByteArrayOutputStream();
 
-                        try (QueueInputStream qis = new QueueInputStream(); QueueOutputStream qos = qis.newQueueOutputStream(); BufferedInputStream bis = new BufferedInputStream(Channels.newInputStream(f.getChannel())); CipherInputStream cis = new CipherInputStream(qis, genCrypter("AES", "AES/CTR/NoPadding", _upload.getByte_file_key(), forwardMEGALinkKeyIV(_upload.getByte_file_iv(), chunk_offset))); OutputStream out = new ThrottledOutputStream(con.getOutputStream(), _upload.getMain_panel().getStream_supervisor())) {
+                        try (RandomAccessFile f = new RandomAccessFile(_upload.getFile_name(), "r"); QueueInputStream qis = new QueueInputStream(); QueueOutputStream qos = qis.newQueueOutputStream(); BufferedInputStream bis = new BufferedInputStream(Channels.newInputStream(_seek(f, chunk_offset).getChannel())); CipherInputStream cis = new CipherInputStream(qis, genCrypter("AES", "AES/CTR/NoPadding", _upload.getByte_file_key(), forwardMEGALinkKeyIV(_upload.getByte_file_iv(), chunk_offset))); OutputStream out = new ThrottledOutputStream(con.getOutputStream(), _upload.getMain_panel().getStream_supervisor())) {
 
                             LOG.log(Level.INFO, "{0} Uploading chunk {1} from worker {2} {3}...", new Object[]{Thread.currentThread().getName(), chunk_id, _id, _upload.getFile_name()});
 
@@ -232,8 +235,6 @@ public class ChunkUploader implements Runnable, SecureSingleThreadNotifiable {
 
                                 }
                             }
-
-                            _upload.getMac_generator().CHUNK_QUEUE.put(chunk_offset, chunk_mac);
                         }
 
                         if (!_exit) {
@@ -242,11 +243,13 @@ public class ChunkUploader implements Runnable, SecureSingleThreadNotifiable {
 
                                 LOG.log(Level.INFO, "{0} Worker {1} Failed : HTTP error code : {2} {3}", new Object[]{Thread.currentThread().getName(), _id, http_status, _upload.getFile_name()});
 
+                                MiscTools.drainAndCloseErrorStream(con);
+
                             } else if (tot_bytes_up == chunk_size || reads == -1) {
 
                                 if (_upload.getProgress() == _upload.getFile_size()) {
                                     _upload.getView().printStatusWarning("Waiting for completion handler ... ***DO NOT EXIT MEGABASTERD NOW***");
-                                    _upload.getView().getPause_button().setEnabled(false);
+                                    MiscTools.GUIRun(() -> _upload.getView().getPause_button().setEnabled(false));
                                 }
 
                                 String httpresponse;
@@ -274,10 +277,14 @@ public class ChunkUploader implements Runnable, SecureSingleThreadNotifiable {
 
                                         _upload.setCompletion_handler(httpresponse);
 
+                                        _upload.getMac_generator().CHUNK_QUEUE.put(chunk_offset, chunk_mac);
+
                                         chunk_error = false;
                                     }
 
                                 } else if (_upload.getProgress() != _upload.getFile_size() || _upload.getCompletion_handler() != null) {
+
+                                    _upload.getMac_generator().CHUNK_QUEUE.put(chunk_offset, chunk_mac);
 
                                     chunk_error = false;
                                 }

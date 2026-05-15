@@ -517,7 +517,7 @@ public class SettingsDialog extends javax.swing.JDialog {
 
                         try {
 
-                            pass = new String(CryptTools.aes_cbc_decrypt_pkcs7(BASE642Bin((String) data.get("password")), _main_panel.getMaster_pass(), CryptTools.AES_ZERO_IV), "UTF-8");
+                            pass = new String(CryptTools.aes_cbc_decrypt_at_rest(BASE642Bin((String) data.get("password")), _main_panel.getMaster_pass()), "UTF-8");
 
                         } catch (NoSuchAlgorithmException | NoSuchPaddingException | InvalidKeyException | InvalidAlgorithmParameterException | IllegalBlockSizeException | BadPaddingException ex) {
                             LOG.log(Level.SEVERE, ex.getMessage());
@@ -538,9 +538,9 @@ public class SettingsDialog extends javax.swing.JDialog {
 
                         try {
 
-                            user = new String(CryptTools.aes_cbc_decrypt_pkcs7(BASE642Bin((String) data.get("user")), _main_panel.getMaster_pass(), CryptTools.AES_ZERO_IV), "UTF-8");
+                            user = new String(CryptTools.aes_cbc_decrypt_at_rest(BASE642Bin((String) data.get("user")), _main_panel.getMaster_pass()), "UTF-8");
 
-                            apikey = new String(CryptTools.aes_cbc_decrypt_pkcs7(BASE642Bin((String) data.get("apikey")), _main_panel.getMaster_pass(), CryptTools.AES_ZERO_IV), "UTF-8");
+                            apikey = new String(CryptTools.aes_cbc_decrypt_at_rest(BASE642Bin((String) data.get("apikey")), _main_panel.getMaster_pass()), "UTF-8");
 
                         } catch (NoSuchAlgorithmException | NoSuchPaddingException | InvalidKeyException | InvalidAlgorithmParameterException | IllegalBlockSizeException | BadPaddingException ex) {
                             LOG.log(Level.SEVERE, ex.getMessage());
@@ -2409,9 +2409,9 @@ public class SettingsDialog extends javax.swing.JDialog {
 
                             if (_main_panel.getMaster_pass_hash() != null) {
 
-                                user_table = Bin2BASE64(CryptTools.aes_cbc_encrypt_pkcs7(user_table.getBytes("UTF-8"), _main_panel.getMaster_pass(), CryptTools.AES_ZERO_IV));
+                                user_table = Bin2BASE64(CryptTools.aes_cbc_encrypt_at_rest(user_table.getBytes("UTF-8"), _main_panel.getMaster_pass()));
 
-                                apikey_table = Bin2BASE64(CryptTools.aes_cbc_encrypt_pkcs7(apikey_table.getBytes("UTF-8"), _main_panel.getMaster_pass(), CryptTools.AES_ZERO_IV));
+                                apikey_table = Bin2BASE64(CryptTools.aes_cbc_encrypt_at_rest(apikey_table.getBytes("UTF-8"), _main_panel.getMaster_pass()));
                             }
 
                             DBTools.insertELCAccount(host_table, user_table, apikey_table);
@@ -2428,9 +2428,9 @@ public class SettingsDialog extends javax.swing.JDialog {
 
                                 try {
 
-                                    user = new String(CryptTools.aes_cbc_decrypt_pkcs7(BASE642Bin(user), _main_panel.getMaster_pass(), CryptTools.AES_ZERO_IV), "UTF-8");
+                                    user = new String(CryptTools.aes_cbc_decrypt_at_rest(BASE642Bin(user), _main_panel.getMaster_pass()), "UTF-8");
 
-                                    apikey = new String(CryptTools.aes_cbc_decrypt_pkcs7(BASE642Bin(apikey), _main_panel.getMaster_pass(), CryptTools.AES_ZERO_IV), "UTF-8");
+                                    apikey = new String(CryptTools.aes_cbc_decrypt_at_rest(BASE642Bin(apikey), _main_panel.getMaster_pass()), "UTF-8");
 
                                 } catch (Exception ex) {
                                     LOG.log(Level.SEVERE, ex.getMessage());
@@ -2445,9 +2445,9 @@ public class SettingsDialog extends javax.swing.JDialog {
 
                                 if (_main_panel.getMaster_pass() != null) {
 
-                                    user = Bin2BASE64(CryptTools.aes_cbc_encrypt_pkcs7(user_table.getBytes("UTF-8"), _main_panel.getMaster_pass(), CryptTools.AES_ZERO_IV));
+                                    user = Bin2BASE64(CryptTools.aes_cbc_encrypt_at_rest(user_table.getBytes("UTF-8"), _main_panel.getMaster_pass()));
 
-                                    apikey = Bin2BASE64(CryptTools.aes_cbc_encrypt_pkcs7(apikey_table.getBytes("UTF-8"), _main_panel.getMaster_pass(), CryptTools.AES_ZERO_IV));
+                                    apikey = Bin2BASE64(CryptTools.aes_cbc_encrypt_at_rest(apikey_table.getBytes("UTF-8"), _main_panel.getMaster_pass()));
 
                                 }
 
@@ -2525,16 +2525,24 @@ public class SettingsDialog extends javax.swing.JDialog {
 
                                     if (!_main_panel.getMega_active_accounts().containsKey(email) && ma.check2FA(email)) {
 
-                                        Get2FACode dialog = new Get2FACode((Frame) getParent(), true, email, _main_panel);
+                                        final String[] code_holder = {null};
+                                        final boolean[] cancelled = {false};
+                                        final String f_email = email;
+                                        MiscTools.GUIRunAndWait(() -> {
+                                            Get2FACode dialog = new Get2FACode((Frame) getParent(), true, f_email, _main_panel);
+                                            dialog.setLocationRelativeTo(tthis);
+                                            dialog.setVisible(true);
+                                            if (dialog.isCode_ok()) {
+                                                code_holder[0] = dialog.getPin_code();
+                                            } else {
+                                                cancelled[0] = true;
+                                            }
+                                        });
 
-                                        dialog.setLocationRelativeTo(tthis);
-
-                                        dialog.setVisible(true);
-
-                                        if (dialog.isCode_ok()) {
-                                            pincode = dialog.getPin_code();
-                                        } else {
+                                        if (cancelled[0]) {
                                             error_2FA = true;
+                                        } else {
+                                            pincode = code_holder[0];
                                         }
                                     }
 
@@ -2550,7 +2558,7 @@ public class SettingsDialog extends javax.swing.JDialog {
 
                                             if (_main_panel.getMaster_pass() != null) {
 
-                                                DBTools.insertMegaSession(email, CryptTools.aes_cbc_encrypt_pkcs7(bs.toByteArray(), _main_panel.getMaster_pass(), CryptTools.AES_ZERO_IV), true);
+                                                DBTools.insertMegaSession(email, CryptTools.aes_cbc_encrypt_at_rest(bs.toByteArray(), _main_panel.getMaster_pass()), true);
 
                                             } else {
 
@@ -2563,11 +2571,11 @@ public class SettingsDialog extends javax.swing.JDialog {
 
                                             if (_main_panel.getMaster_pass_hash() != null) {
 
-                                                password = Bin2BASE64(CryptTools.aes_cbc_encrypt_pkcs7(pass.getBytes("UTF-8"), _main_panel.getMaster_pass(), CryptTools.AES_ZERO_IV));
+                                                password = Bin2BASE64(CryptTools.aes_cbc_encrypt_at_rest(pass.getBytes("UTF-8"), _main_panel.getMaster_pass()));
 
-                                                password_aes = Bin2BASE64(CryptTools.aes_cbc_encrypt_pkcs7(i32a2bin(ma.getPassword_aes()), _main_panel.getMaster_pass(), CryptTools.AES_ZERO_IV));
+                                                password_aes = Bin2BASE64(CryptTools.aes_cbc_encrypt_at_rest(i32a2bin(ma.getPassword_aes()), _main_panel.getMaster_pass()));
 
-                                                user_hash = Bin2BASE64(CryptTools.aes_cbc_encrypt_pkcs7(UrlBASE642Bin(ma.getUser_hash()), _main_panel.getMaster_pass(), CryptTools.AES_ZERO_IV));
+                                                user_hash = Bin2BASE64(CryptTools.aes_cbc_encrypt_at_rest(UrlBASE642Bin(ma.getUser_hash()), _main_panel.getMaster_pass()));
                                             }
 
                                             DBTools.insertMegaAccount(email, password, password_aes, user_hash);
@@ -2593,7 +2601,7 @@ public class SettingsDialog extends javax.swing.JDialog {
 
                                     try {
 
-                                        password = new String(CryptTools.aes_cbc_decrypt_pkcs7(BASE642Bin(password), _main_panel.getMaster_pass(), CryptTools.AES_ZERO_IV), "UTF-8");
+                                        password = new String(CryptTools.aes_cbc_decrypt_at_rest(BASE642Bin(password), _main_panel.getMaster_pass()), "UTF-8");
 
                                     } catch (Exception ex) {
                                         LOG.log(Level.SEVERE, ex.getMessage());
@@ -2612,16 +2620,24 @@ public class SettingsDialog extends javax.swing.JDialog {
 
                                         if (!_main_panel.getMega_active_accounts().containsKey(email) && ma.check2FA(email)) {
 
-                                            Get2FACode dialog = new Get2FACode((Frame) getParent(), true, email, _main_panel);
+                                            final String[] code_holder = {null};
+                                            final boolean[] cancelled = {false};
+                                            final String f_email = email;
+                                            MiscTools.GUIRunAndWait(() -> {
+                                                Get2FACode dialog = new Get2FACode((Frame) getParent(), true, f_email, _main_panel);
+                                                dialog.setLocationRelativeTo(tthis);
+                                                dialog.setVisible(true);
+                                                if (dialog.isCode_ok()) {
+                                                    code_holder[0] = dialog.getPin_code();
+                                                } else {
+                                                    cancelled[0] = true;
+                                                }
+                                            });
 
-                                            dialog.setLocationRelativeTo(tthis);
-
-                                            dialog.setVisible(true);
-
-                                            if (dialog.isCode_ok()) {
-                                                pincode = dialog.getPin_code();
-                                            } else {
+                                            if (cancelled[0]) {
                                                 error_2FA = true;
+                                            } else {
+                                                pincode = code_holder[0];
                                             }
                                         }
 
@@ -2637,7 +2653,7 @@ public class SettingsDialog extends javax.swing.JDialog {
 
                                                 if (_main_panel.getMaster_pass() != null) {
 
-                                                    DBTools.insertMegaSession(email, CryptTools.aes_cbc_encrypt_pkcs7(bs.toByteArray(), _main_panel.getMaster_pass(), CryptTools.AES_ZERO_IV), true);
+                                                    DBTools.insertMegaSession(email, CryptTools.aes_cbc_encrypt_at_rest(bs.toByteArray(), _main_panel.getMaster_pass()), true);
 
                                                 } else {
 
@@ -2652,11 +2668,11 @@ public class SettingsDialog extends javax.swing.JDialog {
 
                                                 if (_main_panel.getMaster_pass() != null) {
 
-                                                    password = Bin2BASE64(CryptTools.aes_cbc_encrypt_pkcs7(pass.getBytes("UTF-8"), _main_panel.getMaster_pass(), CryptTools.AES_ZERO_IV));
+                                                    password = Bin2BASE64(CryptTools.aes_cbc_encrypt_at_rest(pass.getBytes("UTF-8"), _main_panel.getMaster_pass()));
 
-                                                    password_aes = Bin2BASE64(CryptTools.aes_cbc_encrypt_pkcs7(i32a2bin(ma.getPassword_aes()), _main_panel.getMaster_pass(), CryptTools.AES_ZERO_IV));
+                                                    password_aes = Bin2BASE64(CryptTools.aes_cbc_encrypt_at_rest(i32a2bin(ma.getPassword_aes()), _main_panel.getMaster_pass()));
 
-                                                    user_hash = Bin2BASE64(CryptTools.aes_cbc_encrypt_pkcs7(UrlBASE642Bin(ma.getUser_hash()), _main_panel.getMaster_pass(), CryptTools.AES_ZERO_IV));
+                                                    user_hash = Bin2BASE64(CryptTools.aes_cbc_encrypt_at_rest(UrlBASE642Bin(ma.getUser_hash()), _main_panel.getMaster_pass()));
                                                 }
 
                                                 DBTools.insertMegaAccount(email, password, password_aes, user_hash);
@@ -2829,7 +2845,7 @@ public class SettingsDialog extends javax.swing.JDialog {
                     String pass = null;
                     try {
 
-                        pass = new String(CryptTools.aes_cbc_decrypt_pkcs7(BASE642Bin((String) data.get("password")), _main_panel.getMaster_pass(), CryptTools.AES_ZERO_IV), "UTF-8");
+                        pass = new String(CryptTools.aes_cbc_decrypt_at_rest(BASE642Bin((String) data.get("password")), _main_panel.getMaster_pass()), "UTF-8");
 
                     } catch (NoSuchAlgorithmException | NoSuchPaddingException | InvalidKeyException | InvalidAlgorithmParameterException | IllegalBlockSizeException | BadPaddingException ex) {
                         LOG.log(Level.SEVERE, ex.getMessage());
@@ -2846,9 +2862,9 @@ public class SettingsDialog extends javax.swing.JDialog {
                     String user = null, apikey = null;
                     try {
 
-                        user = new String(CryptTools.aes_cbc_decrypt_pkcs7(BASE642Bin((String) data.get("user")), _main_panel.getMaster_pass(), CryptTools.AES_ZERO_IV), "UTF-8");
+                        user = new String(CryptTools.aes_cbc_decrypt_at_rest(BASE642Bin((String) data.get("user")), _main_panel.getMaster_pass()), "UTF-8");
 
-                        apikey = new String(CryptTools.aes_cbc_decrypt_pkcs7(BASE642Bin((String) data.get("apikey")), _main_panel.getMaster_pass(), CryptTools.AES_ZERO_IV), "UTF-8");
+                        apikey = new String(CryptTools.aes_cbc_decrypt_at_rest(BASE642Bin((String) data.get("apikey")), _main_panel.getMaster_pass()), "UTF-8");
 
                     } catch (NoSuchAlgorithmException | NoSuchPaddingException | InvalidKeyException | InvalidAlgorithmParameterException | IllegalBlockSizeException | BadPaddingException ex) {
                         LOG.log(Level.SEVERE, ex.getMessage());
@@ -3013,11 +3029,11 @@ public class SettingsDialog extends javax.swing.JDialog {
 
                         if (old_master_pass_hash != null) {
 
-                            password = new String(CryptTools.aes_cbc_decrypt_pkcs7(BASE642Bin((String) data.get("password")), old_master_pass, CryptTools.AES_ZERO_IV), "UTF-8");
+                            password = new String(CryptTools.aes_cbc_decrypt_at_rest(BASE642Bin((String) data.get("password")), old_master_pass), "UTF-8");
 
-                            password_aes = Bin2BASE64(CryptTools.aes_cbc_decrypt_pkcs7(BASE642Bin((String) data.get("password_aes")), old_master_pass, CryptTools.AES_ZERO_IV));
+                            password_aes = Bin2BASE64(CryptTools.aes_cbc_decrypt_at_rest(BASE642Bin((String) data.get("password_aes")), old_master_pass));
 
-                            user_hash = Bin2BASE64(CryptTools.aes_cbc_decrypt_pkcs7(BASE642Bin((String) data.get("user_hash")), old_master_pass, CryptTools.AES_ZERO_IV));
+                            user_hash = Bin2BASE64(CryptTools.aes_cbc_decrypt_at_rest(BASE642Bin((String) data.get("user_hash")), old_master_pass));
 
                         } else {
 
@@ -3030,11 +3046,11 @@ public class SettingsDialog extends javax.swing.JDialog {
 
                         if (_main_panel.getMaster_pass() != null) {
 
-                            password = Bin2BASE64(CryptTools.aes_cbc_encrypt_pkcs7(password.getBytes("UTF-8"), _main_panel.getMaster_pass(), CryptTools.AES_ZERO_IV));
+                            password = Bin2BASE64(CryptTools.aes_cbc_encrypt_at_rest(password.getBytes("UTF-8"), _main_panel.getMaster_pass()));
 
-                            password_aes = Bin2BASE64(CryptTools.aes_cbc_encrypt_pkcs7(BASE642Bin(password_aes), _main_panel.getMaster_pass(), CryptTools.AES_ZERO_IV));
+                            password_aes = Bin2BASE64(CryptTools.aes_cbc_encrypt_at_rest(BASE642Bin(password_aes), _main_panel.getMaster_pass()));
 
-                            user_hash = Bin2BASE64(CryptTools.aes_cbc_encrypt_pkcs7(BASE642Bin(user_hash.replace('-', '+').replace('_', '/')), _main_panel.getMaster_pass(), CryptTools.AES_ZERO_IV));
+                            user_hash = Bin2BASE64(CryptTools.aes_cbc_encrypt_at_rest(BASE642Bin(user_hash.replace('-', '+').replace('_', '/')), _main_panel.getMaster_pass()));
                         }
 
                         data.put("password", password);
@@ -3056,9 +3072,9 @@ public class SettingsDialog extends javax.swing.JDialog {
 
                         if (old_master_pass_hash != null) {
 
-                            user = new String(CryptTools.aes_cbc_decrypt_pkcs7(BASE642Bin((String) data.get("user")), old_master_pass, CryptTools.AES_ZERO_IV), "UTF-8");
+                            user = new String(CryptTools.aes_cbc_decrypt_at_rest(BASE642Bin((String) data.get("user")), old_master_pass), "UTF-8");
 
-                            apikey = new String(CryptTools.aes_cbc_decrypt_pkcs7(BASE642Bin((String) data.get("apikey")), old_master_pass, CryptTools.AES_ZERO_IV), "UTF-8");
+                            apikey = new String(CryptTools.aes_cbc_decrypt_at_rest(BASE642Bin((String) data.get("apikey")), old_master_pass), "UTF-8");
 
                         } else {
 
@@ -3070,9 +3086,9 @@ public class SettingsDialog extends javax.swing.JDialog {
 
                         if (_main_panel.getMaster_pass() != null) {
 
-                            user = Bin2BASE64(CryptTools.aes_cbc_encrypt_pkcs7(user.getBytes("UTF-8"), _main_panel.getMaster_pass(), CryptTools.AES_ZERO_IV));
+                            user = Bin2BASE64(CryptTools.aes_cbc_encrypt_at_rest(user.getBytes("UTF-8"), _main_panel.getMaster_pass()));
 
-                            apikey = Bin2BASE64(CryptTools.aes_cbc_encrypt_pkcs7(apikey.getBytes("UTF-8"), _main_panel.getMaster_pass(), CryptTools.AES_ZERO_IV));
+                            apikey = Bin2BASE64(CryptTools.aes_cbc_encrypt_at_rest(apikey.getBytes("UTF-8"), _main_panel.getMaster_pass()));
                         }
 
                         data.put("user", user);
@@ -3143,7 +3159,15 @@ public class SettingsDialog extends javax.swing.JDialog {
         if (run_command_textbox.getText() != null && !"".equals(run_command_textbox.getText().trim())) {
 
             try {
-                Runtime.getRuntime().exec(run_command_textbox.getText().trim());
+                String cmd = run_command_textbox.getText().trim();
+                java.io.File f = new java.io.File(cmd);
+                java.util.List<String> argv;
+                if (f.exists()) {
+                    argv = java.util.Collections.singletonList(cmd);
+                } else {
+                    argv = java.util.Arrays.asList(cmd.split("\\s+"));
+                }
+                new ProcessBuilder(argv).inheritIO().start();
             } catch (IOException ex) {
                 Logger.getLogger(MiscTools.class.getName()).log(Level.SEVERE, ex.getMessage());
                 JOptionPane.showMessageDialog(this, ex.getMessage(), "Error", JOptionPane.ERROR_MESSAGE);
@@ -3492,11 +3516,29 @@ public class SettingsDialog extends javax.swing.JDialog {
 
                     DefaultTableModel model = (DefaultTableModel) mega_accounts_table.getModel();
 
+                    int skipped = 0;
                     for (String line : result) {
 
-                        String email = MiscTools.findFirstRegex("^[^#]+", line, 0).trim();
-                        String pass = MiscTools.findFirstRegex("^[^#]+#(.+)$", line, 1);
+                        // Skip lines that aren't in EMAIL#PASS format (comments,
+                        // garbage, accidental blank-ish rows). Previously these
+                        // produced null-pass entries that NPE'd the save loop.
+                        // See #645.
+                        int sep = line.indexOf('#');
+                        if (sep <= 0 || sep >= line.length() - 1) {
+                            skipped++;
+                            continue;
+                        }
+                        String email = line.substring(0, sep).trim();
+                        String pass = line.substring(sep + 1).trim();
+                        if (email.isEmpty() || pass.isEmpty()) {
+                            skipped++;
+                            continue;
+                        }
                         model.addRow(new Object[]{email, pass});
+                    }
+
+                    if (skipped > 0) {
+                        Logger.getLogger(SettingsDialog.class.getName()).log(Level.WARNING, "Account import: skipped {0} malformed line(s) (expected EMAIL#PASS per line)", skipped);
                     }
 
                     mega_accounts_table.setModel(model);
