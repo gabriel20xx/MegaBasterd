@@ -928,13 +928,13 @@ public final class SmartMegaProxyManager {
 
                 _main_panel.getView().updateSmartProxyStatus("SmartProxy: ON (" + String.valueOf(getProxyCount()) + ")" + (this.isForce_smart_proxy() ? " F!" : ""));
 
-                LOG.log(Level.INFO, "{0} Smart Proxy Manager: proxy list refreshed ({1})", new Object[]{Thread.currentThread().getName(), _proxy_list.size()});
+                LOG.log(Level.FINE, "{0} Smart Proxy Manager: proxy list refreshed ({1})", new Object[]{Thread.currentThread().getName(), _proxy_list.size()});
 
             } else if (!custom_clean_list.isEmpty()) {
 
                 _main_panel.getView().updateSmartProxyStatus("SmartProxy: ON (" + String.valueOf(getProxyCount()) + ")" + (this.isForce_smart_proxy() ? " F!" : ""));
 
-                LOG.log(Level.INFO, "{0} Smart Proxy Manager: proxy list refreshed ({1})", new Object[]{Thread.currentThread().getName(), _proxy_list.size()});
+                LOG.log(Level.FINE, "{0} Smart Proxy Manager: proxy list refreshed ({1})", new Object[]{Thread.currentThread().getName(), _proxy_list.size()});
             } else {
                 _main_panel.getView().updateSmartProxyStatus("SmartProxy: ON (0 proxies!)" + (this.isForce_smart_proxy() ? " F!" : ""));
                 LOG.log(Level.INFO, "{0} Smart Proxy Manager: NO PROXYS");
