@@ -103,6 +103,13 @@ public class FolderLinkDialog extends javax.swing.JDialog {
             THREAD_POOL.execute(() -> {
                 _loadMegaDirTree();
 
+                // If the user closed the dialog while the tree was loading,
+                // dispose() has already nulled the tree model -- skip the
+                // rest to avoid a silent NPE inside _genDownloadLiks.
+                if (exit) {
+                    return;
+                }
+
                 if (_mega_error == 0) {
 
                     _genDownloadLiks();
@@ -301,34 +308,43 @@ public class FolderLinkDialog extends javax.swing.JDialog {
     private void skip_buttonActionPerformed(java.awt.event.ActionEvent evt) {//GEN-FIRST:event_skip_buttonActionPerformed
 
         if (deleteSelectedTreeItems(file_tree)) {
-            file_tree.setEnabled(false);
-            node_bar.setVisible(true);
-            skip_rest_button.setEnabled(false);
-            skip_button.setEnabled(false);
-            THREAD_POOL.execute(() -> {
-                MiscTools.resetTreeFolderSizes(((MegaMutableTreeNode) file_tree.getModel().getRoot()));
-                MiscTools.calculateTreeFolderSizes(((MegaMutableTreeNode) file_tree.getModel().getRoot()));
-                _genDownloadLiks();
-                MiscTools.GUIRun(() -> {
-                    restore_button.setVisible(true);
-
-                    file_tree.setEnabled(true);
-
-                    file_tree.setModel(new DefaultTreeModel((TreeNode) file_tree.getModel().getRoot()));
-
-                    boolean root_childs = ((TreeNode) file_tree.getModel().getRoot()).getChildCount() > 0;
-
-                    dance_button.setEnabled(root_childs);
-
-                    skip_button.setEnabled(root_childs);
-
-                    skip_rest_button.setEnabled(root_childs);
-                });
-            });
-
+            _afterTreeMutation();
         }
 
     }//GEN-LAST:event_skip_buttonActionPerformed
+
+    /**
+     * Post-mutation refresh shared by the REMOVE THIS / REMOVE ALL EXCEPT THIS
+     * buttons and the right-click context menu (see attachTreeContextMenu).
+     * Recalculates folder sizes off the EDT and then re-enables / re-disables
+     * the action controls depending on whether anything is left in the tree.
+     */
+    private void _afterTreeMutation() {
+        file_tree.setEnabled(false);
+        node_bar.setVisible(true);
+        skip_rest_button.setEnabled(false);
+        skip_button.setEnabled(false);
+        THREAD_POOL.execute(() -> {
+            MiscTools.resetTreeFolderSizes(((MegaMutableTreeNode) file_tree.getModel().getRoot()));
+            MiscTools.calculateTreeFolderSizes(((MegaMutableTreeNode) file_tree.getModel().getRoot()));
+            _genDownloadLiks();
+            MiscTools.GUIRun(() -> {
+                restore_button.setVisible(true);
+
+                file_tree.setEnabled(true);
+
+                file_tree.setModel(new DefaultTreeModel((TreeNode) file_tree.getModel().getRoot()));
+
+                boolean root_childs = ((TreeNode) file_tree.getModel().getRoot()).getChildCount() > 0;
+
+                dance_button.setEnabled(root_childs);
+
+                skip_button.setEnabled(root_childs);
+
+                skip_rest_button.setEnabled(root_childs);
+            });
+        });
+    }
 
     private void dance_buttonActionPerformed(java.awt.event.ActionEvent evt) {//GEN-FIRST:event_dance_buttonActionPerformed
 
@@ -340,37 +356,7 @@ public class FolderLinkDialog extends javax.swing.JDialog {
     private void skip_rest_buttonActionPerformed(java.awt.event.ActionEvent evt) {//GEN-FIRST:event_skip_rest_buttonActionPerformed
 
         if (deleteAllExceptSelectedTreeItems(file_tree)) {
-            file_tree.setEnabled(false);
-            node_bar.setVisible(true);
-            skip_rest_button.setEnabled(false);
-            skip_button.setEnabled(false);
-
-            THREAD_POOL.execute(() -> {
-
-                MiscTools.resetTreeFolderSizes(((MegaMutableTreeNode) file_tree.getModel().getRoot()));
-
-                MiscTools.calculateTreeFolderSizes(((MegaMutableTreeNode) file_tree.getModel().getRoot()));
-
-                _genDownloadLiks();
-
-                MiscTools.GUIRunAndWait(() -> {
-                    restore_button.setVisible(true);
-
-                    file_tree.setEnabled(true);
-
-                    file_tree.setModel(new DefaultTreeModel((TreeNode) file_tree.getModel().getRoot()));
-
-                    boolean root_childs = ((TreeNode) file_tree.getModel().getRoot()).getChildCount() > 0;
-
-                    dance_button.setEnabled(root_childs);
-
-                    skip_button.setEnabled(root_childs);
-
-                    skip_rest_button.setEnabled(root_childs);
-
-                });
-            });
-
+            _afterTreeMutation();
         }
     }//GEN-LAST:event_skip_rest_buttonActionPerformed
 
@@ -416,7 +402,7 @@ public class FolderLinkDialog extends javax.swing.JDialog {
     private void formWindowClosing(java.awt.event.WindowEvent evt) {//GEN-FIRST:event_formWindowClosing
         // TODO add your handling code here:
 
-        if (working && JOptionPane.showConfirmDialog(this, "EXIT?") == 0) {
+        if (working && JOptionPane.showConfirmDialog(this, I18n.tr("ui.confirm.exit_question")) == 0) {
             dispose();
             exit = true;
         } else if (!working) {
@@ -451,8 +437,14 @@ public class FolderLinkDialog extends javax.swing.JDialog {
             int r = -1;
 
             if (ma.existsCachedFolderNodes(folder_id)) {
-                r = JOptionPane.showConfirmDialog(this, "Do you want to use FOLDER CACHED VERSION?\n\n(It could speed up the loading of very large folders)", "FOLDER CACHE", JOptionPane.YES_NO_OPTION);
-
+                // JOptionPane must run on the EDT; calling it from the
+                // THREAD_POOL worker that runs _loadMegaDirTree mixed Swing
+                // state across threads.
+                final int[] rr = {-1};
+                MiscTools.GUIRunAndWait(() -> {
+                    rr[0] = JOptionPane.showConfirmDialog(this, I18n.tr("ui.confirm.folder_cache.message"), I18n.tr("ui.confirm.folder_cache.title"), JOptionPane.YES_NO_OPTION);
+                });
+                r = rr[0];
             }
 
             if (r == 0) {
@@ -548,6 +540,15 @@ public class FolderLinkDialog extends javax.swing.JDialog {
 
                         current_node = parent_node;
 
+                        // Keep current_id in sync with current_node while we
+                        // climb -- otherwise the subfolder-detection branch
+                        // below keeps comparing subfolder_id against the id
+                        // of the original leaf and can only ever match when
+                        // the outer iteration starts on the subfolder node
+                        // itself. That happens to work today thanks to
+                        // HashMap iterating every node, but it's fragile.
+                        current_id = (String) parent_hashmap_node.get("h");
+
                     } else if (subfolder_id != null && subfolder_id.equals(current_id)) {
 
                         root = current_node;
@@ -597,6 +598,18 @@ public class FolderLinkDialog extends javax.swing.JDialog {
                     ftree.setRootVisible(roott != null ? roott.getChildCount() > 0 : false);
 
                     ftree.setEnabled(true);
+
+                    // Mount the right-click context menu so the user doesn't
+                    // have to Ctrl+click + click "REMOVE THIS" to prune the
+                    // tree. The buttons are still wired for users who prefer
+                    // them. Idempotent: attachTreeContextMenu only registers
+                    // one MouseListener per call, but _loadMegaDirTree is
+                    // also invoked by the Restore button, so guard against
+                    // double registration via a sentinel client property.
+                    if (file_tree.getClientProperty("mb.tree.context_menu_attached") == null) {
+                        MiscTools.attachTreeContextMenu(file_tree, this::_afterTreeMutation);
+                        file_tree.putClientProperty("mb.tree.context_menu_attached", Boolean.TRUE);
+                    }
                 });
 
             }
@@ -605,7 +618,10 @@ public class FolderLinkDialog extends javax.swing.JDialog {
 
             LOG.log(SEVERE, null, mex);
 
-            _mega_error = mex.getCode();
+            // _mega_error == 0 is the success sentinel for the caller; coerce
+            // a hypothetical zero MEGA code to 1 so any thrown exception is
+            // always treated as failure.
+            _mega_error = mex.getCode() != 0 ? mex.getCode() : 1;
 
         } catch (Exception ex) {
 

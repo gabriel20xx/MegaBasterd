@@ -20,12 +20,14 @@ import java.net.InetAddress;
 import java.net.MalformedURLException;
 import java.net.PasswordAuthentication;
 import java.net.URL;
+import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
@@ -43,15 +45,22 @@ import java.nio.file.Paths;
  */
 public final class SmartMegaProxyManager {
 
-    public static String DEFAULT_SMART_PROXY_URL = null;
     public static final int PROXY_BLOCK_TIME = 300;
     public static final int PROXY_AUTO_REFRESH_TIME = 60;
     public static final int PROXY_AUTO_REFRESH_SLEEP_TIME = 30;
     public static final boolean RESET_SLOT_PROXY = true;
     public static final boolean RANDOM_SELECT = true;
+    /**
+     * Default for the post-509 window during which SmartProxy stays active for
+     * the affected download even after a successful chunk. Was the hard-coded
+     * {@code ChunkDownloader.SMART_PROXY_RECHECK_509_TIME = 3600}; now
+     * overridable via DB setting "smart_proxy_509_recheck_window" so a user
+     * whose VPN clears quota in seconds isn't forced into a 1-hour proxy-mode
+     * window. (#751 / C4)
+     */
+    public static final int RECHECK_509_WINDOW_DEFAULT = 3600;
 
     private static final Logger LOG = Logger.getLogger(SmartMegaProxyManager.class.getName());
-    private volatile String _proxy_list_url;
     private final ConcurrentHashMap<String, Long[]> _proxy_list;
     // ConcurrentHashMap (not HashMap): the Authenticator.getPasswordAuthentication
     // callback at SmartProxyAuthenticator.getPasswordAuthentication() runs on
@@ -70,6 +79,7 @@ public final class SmartMegaProxyManager {
     private volatile long _last_refresh_timestamp;
     private volatile boolean _random_select;
     private volatile boolean _reset_slot_proxy;
+    private volatile int _recheck_509_window;
 
     private final Object _ikev2_lock = new Object();
     private volatile String _active_ikev2_key;
@@ -86,6 +96,16 @@ public final class SmartMegaProxyManager {
         return _reset_slot_proxy;
     }
 
+    /**
+     * Window (seconds) after a 509 during which SmartProxy stays "armed" for
+     * affected downloads, even after individual chunks succeed. Configurable
+     * via DB setting "smart_proxy_509_recheck_window". Defaults to
+     * {@link #RECHECK_509_WINDOW_DEFAULT} (3600 s). (#751 / C4)
+     */
+    public int getRecheck_509_window() {
+        return _recheck_509_window;
+    }
+
     public int getProxy_timeout() {
         return _proxy_timeout;
     }
@@ -94,32 +114,77 @@ public final class SmartMegaProxyManager {
         return _force_smart_proxy;
     }
 
-    public SmartMegaProxyManager(String proxy_list_url, MainPanel main_panel) {
-        _proxy_list_url = (proxy_list_url != null && !"".equals(proxy_list_url)) ? proxy_list_url : DEFAULT_SMART_PROXY_URL;
+    public SmartMegaProxyManager(MainPanel main_panel) {
+        // Proxy list URLs are now discovered by scanning the "custom_proxy_list"
+        // textarea for '#URL' lines on every refresh, so the manager no longer
+        // needs an explicit URL parameter and can aggregate from multiple
+        // sources simultaneously. (#753)
         _proxy_list = new ConcurrentHashMap<>();
         _main_panel = main_panel;
+
+        // Install the JDK-wide proxy Authenticator HERE (was only done once at
+        // startup in MainPanel.run(), inside the `if (_use_smart_proxy)` block).
+        // When the user started with SmartProxy DISABLED and enabled it at
+        // runtime, MainPanelView.settings_menuActionPerformed built this
+        // manager but NEVER installed the Authenticator, so any proxy that
+        // requires credentials (the IP:PORT@b64user:b64pass form parsed into
+        // PROXY_LIST_AUTH and consumed by SmartProxyAuthenticator) silently
+        // got a 407 Proxy Authentication Required on every chunk / /cs request
+        // -- the whole pool looked dead and downloads never resumed, while a
+        // restart with SmartProxy pre-enabled worked. Doing it in the
+        // constructor makes both paths (startup and runtime-enable) identical.
+        // setDefault is a global, idempotent, thread-agnostic operation. (#778)
+        Authenticator.setDefault(new SmartProxyAuthenticator());
+
+        // ChunkDownloader.java:200 silently disables SmartProxy when a static
+        // HTTP proxy is also configured (`&& !MainPanel.isUse_proxy()`). The
+        // user often doesn't realise this and assumes SmartProxy is still
+        // protecting them from 509. Surface it loudly at startup. (#751)
+        if (MainPanel.isUse_proxy()) {
+            LOG.log(Level.WARNING, "[SmartProxy] Static HTTP proxy is ALSO enabled in settings; "
+                    + "SmartProxy will be IGNORED by ChunkDownloader (static proxy takes priority). "
+                    + "Disable the static HTTP proxy if you want SmartProxy to handle 509.");
+        }
 
         refreshSmartProxySettings();
 
         THREAD_POOL.execute(() -> {
             refreshProxyList();
 
-            while (true) {
+            // Honour MainPanel.isExit() so the auto-refresh thread terminates
+            // cleanly on shutdown instead of spinning until JVM kills the
+            // daemon. Also restore the interrupt flag on InterruptedException.
+            while (!_main_panel.isExit()) {
 
-                while (System.currentTimeMillis() < _last_refresh_timestamp + _autorefresh_time * 60 * 1000) {
+                while (!_main_panel.isExit() && System.currentTimeMillis() < _last_refresh_timestamp + _autorefresh_time * 60L * 1000L) {
                     try {
                         Thread.sleep(1000);
                     } catch (InterruptedException ex) {
-                        Logger.getLogger(SmartMegaProxyManager.class.getName()).log(Level.SEVERE, null, ex);
+                        Thread.currentThread().interrupt();
+                        return;
                     }
                 }
 
-                if (MainPanel.isUse_smart_proxy()) {
+                if (!_main_panel.isExit() && MainPanel.isUse_smart_proxy()) {
 
                     refreshProxyList();
                 }
             }
         });
+    }
+
+    private static int clampWithWarn(String key, int value, int min, int max) {
+        if (value < min) {
+            LOG.log(Level.WARNING, "[SmartProxy] setting {0}={1} is below the supported minimum {2}; clamping. Values that low make the recovery path effectively unusable.",
+                    new Object[]{key, value, min});
+            return min;
+        }
+        if (value > max) {
+            LOG.log(Level.WARNING, "[SmartProxy] setting {0}={1} is above the supported maximum {2}; clamping.",
+                    new Object[]{key, value, max});
+            return max;
+        }
+        return value;
     }
 
     private synchronized int countBlockedProxies() {
@@ -130,7 +195,7 @@ public final class SmartMegaProxyManager {
 
         for (String k : _proxy_list.keySet()) {
 
-            if (_proxy_list.get(k)[0] != -1 && _proxy_list.get(k)[0] > current_time - _ban_time * 1000) {
+            if (_proxy_list.get(k)[0] != -1 && _proxy_list.get(k)[0] > current_time - _ban_time * 1000L) {
 
                 i++;
             }
@@ -140,14 +205,53 @@ public final class SmartMegaProxyManager {
 
     }
 
-    public synchronized void refreshSmartProxySettings() {
+    // NOT synchronized (was, until #778): this only reads DB settings and
+    // writes the manager's own `volatile` config fields (_ban_time,
+    // _proxy_timeout, _force_smart_proxy, ...). It never touches _proxy_list,
+    // so it has no reason to contend on the pool monitor. It is called on the
+    // Swing EDT from MainPanelView.settings_menuActionPerformed; sharing the
+    // monitor with getProxy()/refreshProxyList() meant a worker mid-refresh
+    // (blocking HTTP fetch) or mid-getProxy could freeze the UI. The fields
+    // are independent settings with no cross-field invariant, so volatile
+    // visibility is sufficient. (#778)
+    public void refreshSmartProxySettings() {
         String smartproxy_ban_time = DBTools.selectSettingValue("smartproxy_ban_time");
 
-        _ban_time = MiscTools.parseIntOr(smartproxy_ban_time, PROXY_BLOCK_TIME);
+        // ban_time semantics:
+        //   0       = permanent ban (blockProxy removes the entry from the pool)
+        //   1..9    = allowed but risky: the banned proxy can be re-selected
+        //             before the worker that banned it finishes retrying
+        //             somewhere else, so a bad-pool can churn. We honour the
+        //             user's value but log a WARNING.
+        //   10..3600 = normal range
+        //   >3600   = clamp to 3600 (anything longer is effectively permanent
+        //             without using the 0 sentinel; clamping protects against
+        //             accidental enormous values).
+        // The previous code (audit #752) clamped <10 to 10, which silently
+        // ignored both "0 = permanent" (documented in the SettingsDialog UI)
+        // and short ban times intentionally chosen by users running curated
+        // private proxy pools. (#757)
+        int requested_ban = MiscTools.parseIntOr(smartproxy_ban_time, PROXY_BLOCK_TIME);
+        if (requested_ban < 0) {
+            LOG.log(Level.WARNING, "[SmartProxy] setting smartproxy_ban_time={0} is negative; treating as 0 (permanent ban).", requested_ban);
+            requested_ban = 0;
+        } else if (requested_ban > 0 && requested_ban < 10) {
+            LOG.log(Level.WARNING, "[SmartProxy] setting smartproxy_ban_time={0}s is below the recommended minimum of 10s. A banned proxy may be re-selected before the worker that banned it has retried elsewhere, causing pool churn. Honouring your value, but expect noisier logs.", requested_ban);
+        } else if (requested_ban > 3600) {
+            LOG.log(Level.WARNING, "[SmartProxy] setting smartproxy_ban_time={0} exceeds the maximum 3600s; clamping. If you want a permanent ban, set the value to 0.", requested_ban);
+            requested_ban = 3600;
+        }
+        _ban_time = requested_ban;
 
         String smartproxy_timeout = DBTools.selectSettingValue("smartproxy_timeout");
 
-        _proxy_timeout = MiscTools.parseIntOr(smartproxy_timeout, Transference.HTTP_PROXY_TIMEOUT / 1000) * 1000;
+        // Clamp proxy_timeout to [3, 120] s. Below 3 s most real-world
+        // public proxies cannot complete a TCP+TLS handshake, so every
+        // attempt times out and the worker burns through the list without
+        // ever connecting. Stored and reported in seconds; converted to
+        // ms below for the JDK URLConnection setters. (#752)
+        int requested_timeout = MiscTools.parseIntOr(smartproxy_timeout, Transference.HTTP_PROXY_TIMEOUT / 1000);
+        _proxy_timeout = clampWithWarn("smartproxy_timeout", requested_timeout, 3, 120) * 1000;
 
         String force_smart_proxy_string = DBTools.selectSettingValue("force_smart_proxy");
 
@@ -180,7 +284,30 @@ public final class SmartMegaProxyManager {
             _random_select = RANDOM_SELECT;
         }
 
-        LOG.log(Level.INFO, "SmartProxy BAN_TIME: " + String.valueOf(_ban_time) + "   TIMEOUT: " + String.valueOf(_proxy_timeout / 1000) + "   REFRESH: " + String.valueOf(_autorefresh_time) + "   FORCE: " + String.valueOf(_force_smart_proxy) + "   RANDOM: " + String.valueOf(_random_select) + "   RESET-SLOT-PROXY: " + String.valueOf(_reset_slot_proxy));
+        String recheck_setting = DBTools.selectSettingValue("smart_proxy_509_recheck_window");
+
+        int recheck = MiscTools.parseIntOr(recheck_setting, RECHECK_509_WINDOW_DEFAULT);
+        // Clamp to a sane range: anything below 60 s is pointless (a refresh
+        // would arrive sooner than that), anything above 24 h is just
+        // "permanent" which is what FORCE proxy mode already expresses.
+        if (recheck < 60) {
+            recheck = 60;
+        } else if (recheck > 86_400) {
+            recheck = 86_400;
+        }
+        _recheck_509_window = recheck;
+
+        LOG.log(Level.INFO, "SmartProxy BAN_TIME: " + String.valueOf(_ban_time) + "   TIMEOUT: " + String.valueOf(_proxy_timeout / 1000) + "   REFRESH: " + String.valueOf(_autorefresh_time) + "   FORCE: " + String.valueOf(_force_smart_proxy) + "   RANDOM: " + String.valueOf(_random_select) + "   RESET-SLOT-PROXY: " + String.valueOf(_reset_slot_proxy) + "   RECHECK-509: " + String.valueOf(_recheck_509_window));
+
+        // Surface activation mode so users who set up "live" proxies and then
+        // see direct downloads understand why: without FORCE, SmartProxy only
+        // engages after MEGA returns HTTP 509 (or while inside the post-509
+        // recheck window). Reported by #757 bug 3.
+        if (_force_smart_proxy) {
+            LOG.log(Level.INFO, "[SmartProxy] mode: FORCE -- every chunk will be routed through a proxy regardless of MEGA quota state.");
+        } else {
+            LOG.log(Level.INFO, "[SmartProxy] mode: PASSIVE -- proxies are only used after MEGA returns HTTP 509 (or while inside the {0}s post-509 recheck window). Enable FORCE SMART PROXY in settings if you want every chunk routed through proxies.", _recheck_509_window);
+        }
     }
 
     public synchronized int getProxyCount() {
@@ -188,7 +315,33 @@ public final class SmartMegaProxyManager {
         return _proxy_list.size();
     }
 
-    public synchronized String[] getProxy(ArrayList<String> excluded) {
+    /**
+     * Returns a snapshot of every proxy in the pool, regardless of ban
+     * state, as {@code {address, "http"|"socks"}} pairs in pool order.
+     * Used by the test dialog to enumerate the pool exhaustively --
+     * {@link #getProxy(ArrayList)} cannot be used for that because it
+     * filters banned entries and ban-recovers via timeout, so a test
+     * could never observe a currently-banned proxy. (#753 audit)
+     */
+    public synchronized java.util.List<String[]> getProxySnapshot() {
+        java.util.List<String[]> snapshot = new ArrayList<>(_proxy_list.size());
+        for (Map.Entry<String, Long[]> e : _proxy_list.entrySet()) {
+            Long[] meta = e.getValue();
+            boolean socks = meta != null && meta[1] != null && meta[1].longValue() != -1L;
+            snapshot.add(new String[]{e.getKey(), socks ? "socks" : "http"});
+        }
+        return snapshot;
+    }
+
+    /**
+     * Selects one usable (non-banned, non-excluded) proxy from the current
+     * pool, or returns {@code null} if none is available right now. Does NOT
+     * sleep or refresh -- it is a pure, fast snapshot pick. Synchronized only
+     * to stay mutually exclusive with {@link #blockProxy}/{@link
+     * #refreshProxyList} during the iteration; it never holds the monitor for
+     * more than the (sub-millisecond) selection. (#778)
+     */
+    private synchronized String[] pickProxy(ArrayList<String> excluded) {
 
         if (_proxy_list.size() > 0) {
 
@@ -230,24 +383,121 @@ public final class SmartMegaProxyManager {
 
             for (String k : keysList) {
 
-                if ((_proxy_list.get(k)[0] == -1 || _proxy_list.get(k)[0] < current_time - _ban_time * 1000) && (excluded == null || !excluded.contains(k))) {
+                Long[] entry = _proxy_list.get(k);
 
-                    return new String[]{k, protoFromFlag(_proxy_list.get(k)[1])};
+                if (entry == null) {
+                    continue;
+                }
+
+                if ((entry[0] == -1 || entry[0] < current_time - _ban_time * 1000L) && (excluded == null || !excluded.contains(k))) {
+
+                    return new String[]{k, protoFromFlag(entry[1])};
                 }
             }
         }
 
-        LOG.log(Level.WARNING, "{0} Smart Proxy Manager: NO PROXYS AVAILABLE!! (Refreshing in " + String.valueOf(PROXY_AUTO_REFRESH_SLEEP_TIME) + " secs...)", new Object[]{Thread.currentThread().getName()});
+        return null;
+    }
 
-        try {
-            Thread.sleep(PROXY_AUTO_REFRESH_SLEEP_TIME * 1000);
-        } catch (InterruptedException ex) {
-            Logger.getLogger(SmartMegaProxyManager.class.getName()).log(Level.SEVERE, null, ex);
+    public String[] getProxy(ArrayList<String> excluded) {
+
+        // Iterative refresh loop with a cap. Was recursive: every call that
+        // found all proxies excluded slept 30s then recursed -- with an
+        // ever-growing excluded list (workers keep adding failed proxies),
+        // a permanently-bad list could deepen the stack indefinitely and
+        // eventually StackOverflowError. 5 attempts == ~2.5 min, plenty for
+        // a refresh to pull a usable proxy.
+        //
+        // NOT synchronized (was, until #778): the selection is delegated to
+        // the synchronized pickProxy() helper, but the Thread.sleep() and
+        // refreshProxyList() below run WITHOUT holding the manager monitor.
+        // The old code held `this` across the whole 30s*5 sleep + blocking
+        // HTTP refresh, so with FORCE mode + N slots hitting an exhausted pool
+        // every worker serialized behind the lock for minutes, and the on-EDT
+        // refreshSmartProxySettings() call froze the UI. (#778)
+        final int MAX_REFRESH_ATTEMPTS = 5;
+
+        for (int attempt = 0; attempt < MAX_REFRESH_ATTEMPTS; attempt++) {
+
+            String[] picked = pickProxy(excluded);
+
+            if (picked != null) {
+                return picked;
+            }
+
+            LOG.log(Level.WARNING, "{0} Smart Proxy Manager: NO PROXYS AVAILABLE!! (Refreshing in {1} secs, attempt {2}/{3})",
+                    new Object[]{Thread.currentThread().getName(), PROXY_AUTO_REFRESH_SLEEP_TIME, attempt + 1, MAX_REFRESH_ATTEMPTS});
+
+            try {
+                Thread.sleep(PROXY_AUTO_REFRESH_SLEEP_TIME * 1000L);
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+                return null;
+            }
+
+            refreshProxyList();
         }
 
-        refreshProxyList();
+        return null;
+    }
 
-        return getProxyCount() > 0 ? getProxy(excluded) : null;
+    /**
+     * Rewrites the {@code custom_proxy_list} DB setting so that the only
+     * inline proxy entries are those whose addresses appear in
+     * {@code working_addrs}. Lines starting with {@code #} (remote URL
+     * sources) and blank separator lines are preserved verbatim, so a
+     * user who relies on auto-refreshed lists can prune dead entries
+     * without losing the URL sources that feed them. The SOCKS marker
+     * and any auth trailer are looked up from live state so each saved
+     * line round-trips through {@link #parseProxyEntry} unchanged. After
+     * writing, kicks an async refresh so the live pool matches the new
+     * textarea immediately. (#753)
+     *
+     * @param working_addrs addresses (IP:PORT) to keep, in the desired
+     *                      output order
+     * @return number of inline entries written
+     * @throws SQLException if the DB write fails
+     */
+    public synchronized int saveWorkingProxiesToCustomList(java.util.Collection<String> working_addrs) throws SQLException {
+
+        String current = DBTools.selectSettingValue("custom_proxy_list");
+        StringBuilder sb = new StringBuilder();
+        if (current != null) {
+            for (String line : current.split("\\r?\\n")) {
+                String trimmed = line.trim();
+                if (trimmed.isEmpty() || trimmed.startsWith("#")) {
+                    sb.append(line).append('\n');
+                }
+            }
+        }
+
+        int written = 0;
+        for (String addr : working_addrs) {
+            Long[] entry = _proxy_list.get(addr);
+            // Entry shape: {ban_ts, type} where type == -1L for HTTP and
+            // 1L for SOCKS. An entry missing from the live map is still
+            // saved (as HTTP, no auth) -- it was working a moment ago,
+            // and over-writing is safer than dropping it silently.
+            boolean socks = entry != null && entry[1] != null && entry[1] != -1L;
+            String auth = PROXY_LIST_AUTH.get(addr);
+            if (socks) {
+                sb.append('*');
+            }
+            sb.append(addr);
+            if (auth != null) {
+                sb.append('@').append(auth);
+            }
+            sb.append('\n');
+            written++;
+        }
+
+        DBTools.insertSettingValue("custom_proxy_list", sb.toString());
+
+        // Refresh asynchronously so the caller (Swing EDT in practice)
+        // returns immediately.
+        MainPanel.THREAD_POOL.execute(this::refreshProxyList);
+
+        return written;
     }
 
     private static String protoFromFlag(Long protoFlag) {
@@ -645,6 +895,15 @@ public final class SmartMegaProxyManager {
 
     public synchronized void blockProxy(String proxy, String cause) {
 
+        // All mutators (blockProxy, refreshProxyList, getProxy) are synchronized
+        // on `this`, so the get-mutate sequence below is atomic w.r.t. other
+        // map operations -- the ConcurrentHashMap is belt-and-braces. The
+        // previous code also did a redundant put() back of the same array
+        // reference; that's a no-op since proxy_data was already in the map.
+        // Use computeIfPresent to express the atomic mutate-in-place clearly,
+        // and to safely no-op if the entry was concurrently removed (e.g.,
+        // by a refreshProxyList() that's running on the same monitor in some
+        // future refactor where this method is no longer synchronized). (#751)
         if (_proxy_list.containsKey(proxy)) {
 
             if (this._ban_time == 0) {
@@ -655,11 +914,10 @@ public final class SmartMegaProxyManager {
 
             } else {
 
-                Long[] proxy_data = _proxy_list.get(proxy);
-
-                proxy_data[0] = System.currentTimeMillis();
-
-                _proxy_list.put(proxy, proxy_data);
+                _proxy_list.computeIfPresent(proxy, (k, proxy_data) -> {
+                    proxy_data[0] = System.currentTimeMillis();
+                    return proxy_data;
+                });
 
                 LOG.log(Level.WARNING, "[Smart Proxy] BLOCKING PROXY {0} ({1} secs) ({2})", new Object[]{proxy, _ban_time, cause});
 
@@ -680,279 +938,329 @@ public final class SmartMegaProxyManager {
         }
     }
 
-    public synchronized void refreshProxyList(String url_list) {
-        if (url_list != null) {
-            _proxy_list_url = url_list;
-        } else {
-            _proxy_list_url = null;
+    /**
+     * Parses a single proxy line into {@code into_list}/{@code into_auth}.
+     * Accepts the historical syntax ({@code [*]IP:PORT[@user_b64:password_b64]})
+     * AND scheme-prefixed forms ({@code http://}, {@code https://},
+     * {@code socks://}, {@code socks4://}, {@code socks4a://}, {@code socks5://}),
+     * which were previously rejected as malformed. (#753)
+     * <p>
+     * Note: authentication is only supported in the legacy
+     * {@code IP:PORT@b64user:b64pass} trailer form. A standard
+     * {@code http://user:pass@host:port} URL is NOT decoded — write
+     * {@code http://host:port@b64user:b64pass} (or the bare equivalent) to
+     * supply credentials.
+     *
+     * @param raw       raw line (will be trimmed; blank lines silently ignored)
+     * @param source    "custom" or "URL" — only used in the warning log
+     * @param into_list destination for {@code IP:PORT -> {ban_ts, type}} entries
+     * @param into_auth destination for {@code IP:PORT -> b64user:b64pass} pairs
+     */
+    private static void parseProxyEntry(String raw, String source,
+            java.util.Map<String, Long[]> into_list,
+            java.util.Map<String, String> into_auth) {
+
+        if (raw == null) {
+            return;
+        }
+        String line = raw.trim();
+        if (line.isEmpty()) {
+            return;
         }
 
-        THREAD_POOL.execute(() -> {
-            refreshProxyList();
-        });
+        // Preserve the local Linux tunnel entry formats while using the
+        // upstream parser for ordinary HTTP/SOCKS entries. These entries are
+        // represented in the same pool with protocol flags so the download
+        // workers can establish the tunnel before opening the MEGA request.
+        String initial_lower = line.toLowerCase();
+        if (initial_lower.startsWith("ikev2://") || initial_lower.startsWith("ikev2 ") || initial_lower.startsWith("ikev2:")) {
+            Ikev2Credentials creds = parseIkev2Credentials(line);
+            if (creds != null) {
+                String key = "ikev2://" + creds.username + "@" + creds.hostname;
+                into_list.put(key, new Long[]{-1L, 2L});
+                IKEV2_AUTH.put(key, creds);
+            } else {
+                LOG.log(Level.WARNING, "[Smart Proxy] skipping malformed {0} IKEv2 entry: {1}", new Object[]{source, raw});
+            }
+            return;
+        }
+
+        if (initial_lower.startsWith("wireguard://")) {
+            String key = line.trim();
+            if (WIREGUARD_CONFIGS.containsKey(key)) {
+                into_list.put(key, new Long[]{-1L, 3L});
+            } else {
+                LOG.log(Level.WARNING, "[Smart Proxy] skipping WireGuard entry without a matching config: {0}", raw);
+            }
+            return;
+        }
+
+        // Lines that start with '#' identify a remote proxy-list URL embedded
+        // in custom_proxy_list. They are extracted elsewhere; silently skip
+        // them here instead of logging them as malformed entries.
+        if (line.startsWith("#")) {
+            return;
+        }
+
+        boolean socks = false;
+        boolean had_scheme = false;
+
+        // Strip the historical "*" SOCKS marker first; it can also precede a
+        // scheme prefix in case a user mixed conventions.
+        if (line.startsWith("*")) {
+            socks = true;
+            line = line.substring(1).trim();
+        }
+
+        // Recognise scheme prefixes case-insensitively. All SOCKS variants
+        // collapse to JDK Proxy.Type.SOCKS. HTTPS proxies also use the
+        // HTTP CONNECT method on the JDK side, so they map to
+        // Proxy.Type.HTTP.
+        String lower = line.toLowerCase();
+        if (lower.startsWith("http://")) {
+            line = line.substring(7);
+            had_scheme = true;
+        } else if (lower.startsWith("https://")) {
+            line = line.substring(8);
+            had_scheme = true;
+        } else if (lower.startsWith("socks5://")) {
+            socks = true;
+            line = line.substring(9);
+            had_scheme = true;
+        } else if (lower.startsWith("socks4a://")) {
+            socks = true;
+            line = line.substring(10);
+            had_scheme = true;
+        } else if (lower.startsWith("socks4://")) {
+            socks = true;
+            line = line.substring(9);
+            had_scheme = true;
+        } else if (lower.startsWith("socks://")) {
+            socks = true;
+            line = line.substring(8);
+            had_scheme = true;
+        }
+
+        if (line.contains("@")) {
+            String[] proxy_parts = line.split("@");
+            if (proxy_parts.length != 2) {
+                // Stray '@' (e.g. user@pass@host:port): can't disambiguate
+                // which half is the host:port, so reject. (#751)
+                LOG.log(Level.WARNING, "[Smart Proxy] skipping malformed {0} entry: {1}", new Object[]{source, raw});
+                return;
+            }
+            // The host:port half may carry a trailing path the scheme brought
+            // along (e.g. http://host:port/foo@auth). Strip from that half
+            // only -- the auth half is base64(user):base64(pass), and the
+            // base64 alphabet includes '/', so a global path-strip would
+            // silently corrupt legitimate auth values (#753 audit).
+            String hostport = proxy_parts[0];
+            int slash = hostport.indexOf('/');
+            if (slash >= 0) {
+                hostport = hostport.substring(0, slash);
+            }
+            hostport = hostport.trim();
+
+            if (!hostport.matches(".+?:[0-9]{1,5}")) {
+                LOG.log(Level.WARNING, "[Smart Proxy] skipping malformed {0} entry: {1}", new Object[]{source, raw});
+                return;
+            }
+
+            // Disambiguation guard: a URL-style "user:pass@host:port"
+            // credential where pass is numeric (e.g. "user:1234") would
+            // ALSO match the legacy "host:port@b64u:b64p" shape on parts[0]
+            // and lead us to store "user:1234" as the host. When the line
+            // had a scheme prefix AND parts[1] itself looks like host:port
+            // (whereas a real base64 trailer has no internal port-shaped
+            // segment), it's almost certainly URL-style auth -- reject
+            // with a pointed log instead of silently misparsing. (#753 audit)
+            if (had_scheme && proxy_parts[1].matches(".+?:[0-9]{1,5}")) {
+                LOG.log(Level.WARNING, "[Smart Proxy] skipping {0} entry with URL-style user:pass@host:port credential (not supported -- use IP:PORT@b64user:b64pass form instead): {1}",
+                        new Object[]{source, raw});
+                return;
+            }
+
+            into_auth.put(hostport, proxy_parts[1]);
+            into_list.put(hostport, new Long[]{-1L, socks ? 1L : -1L});
+            return;
+        }
+
+        // No auth trailer: drop any trailing path the scheme may have
+        // brought along (e.g. http://1.2.3.4:8080/list.txt). Bare lines
+        // without a scheme are not allowed to have a path -- the legacy
+        // parser rejected them via the strict regex.
+        if (had_scheme) {
+            int slash = line.indexOf('/');
+            if (slash >= 0) {
+                line = line.substring(0, slash);
+            }
+        }
+        line = line.trim();
+
+        if (line.matches(".+?:[0-9]{1,5}")) {
+            into_list.put(line, new Long[]{-1L, socks ? 1L : -1L});
+        } else {
+            LOG.log(Level.WARNING, "[Smart Proxy] skipping malformed {0} entry: {1}", new Object[]{source, raw});
+        }
     }
 
-    public synchronized void refreshProxyList() {
-
-        String data;
+    /**
+     * Fetches a single proxy-list URL and merges its entries into the
+     * supplied maps. Throws {@link IOException} on connect/read failure or
+     * non-200 status — callers swallow the exception per-URL so a single
+     * bad source can't kill the whole refresh. (#753)
+     */
+    private static void fetchAndMerge(String url_str,
+            java.util.Map<String, Long[]> into_list,
+            java.util.Map<String, String> into_auth) throws IOException {
 
         HttpURLConnection con = null;
-
         try {
+            URL url = new URL(url_str);
 
-            // Rebuild credential maps from scratch on every refresh.
-            IKEV2_AUTH.clear();
-            WIREGUARD_CONFIGS.clear();
-
-            String custom_proxy_list = (_proxy_list_url == null ? DBTools.selectSettingValue("custom_proxy_list") : null);
-
-            LinkedHashMap<String, Long[]> custom_clean_list = new LinkedHashMap<>();
-
-            HashMap<String, String> custom_clean_list_auth = new HashMap<>();
-
-            if (custom_proxy_list != null) {
-
-                ArrayList<String> custom_list = new ArrayList<>(Arrays.asList(custom_proxy_list.split("\\r?\\n")));
-
-                if (!custom_list.isEmpty()) {
-
-                    for (String proxy : custom_list) {
-
-                        if (proxy == null) {
-                            continue;
-                        }
-
-                        proxy = proxy.trim();
-
-                        if (proxy.isEmpty()) {
-                            continue;
-                        }
-
-                        // IKEv2 entry format (Docker/Linux):
-                        //   ikev2://username:password@hostname
-                        // This is treated as a "smart proxy" entry that establishes an IKEv2 VPN tunnel.
-                        if (proxy.toLowerCase().startsWith("ikev2://") || proxy.toLowerCase().startsWith("ikev2 ") || proxy.toLowerCase().startsWith("ikev2:")) {
-                            Ikev2Credentials creds = parseIkev2Credentials(proxy);
-                            if (creds != null) {
-                                String key = "ikev2://" + creds.username + "@" + creds.hostname;
-                                Long[] proxy_data = new Long[]{-1L, 2L};
-                                custom_clean_list.put(key, proxy_data);
-                                IKEV2_AUTH.put(key, creds);
-                            }
-                            continue;
-                        }
-
-                        boolean socks = false;
-
-                        if (proxy.startsWith("*")) {
-                            socks = true;
-
-                            proxy = proxy.substring(1).trim();
-                        }
-
-                        if (proxy.contains("@")) {
-
-                            String[] proxy_parts = proxy.split("@");
-
-                            if (proxy_parts.length < 2) {
-                                continue;
-                            }
-
-                            String proxy_key = proxy_parts[0].trim();
-                            String proxy_auth = proxy_parts[1].trim();
-
-                            if (proxy_key.isEmpty()) {
-                                continue;
-                            }
-
-                            custom_clean_list_auth.put(proxy_key, proxy_auth);
-
-                            Long[] proxy_data = new Long[]{-1L, socks ? 1L : -1L};
-
-                            custom_clean_list.put(proxy_key, proxy_data);
-
-                        } else if (proxy.matches(".+?:[0-9]{1,5}")) {
-
-                            Long[] proxy_data = new Long[]{-1L, socks ? 1L : -1L};
-
-                            custom_clean_list.put(proxy, proxy_data);
-                        }
-                    }
-                }
-
-                // Auto-load WireGuard configs from /wireguard (Docker volume)
-                loadWireguardConfigs(custom_clean_list);
-
-                if (!custom_clean_list.isEmpty()) {
-
-                    _proxy_list.clear();
-
-                    _proxy_list.putAll(custom_clean_list);
-                }
-
-                if (!custom_clean_list_auth.isEmpty()) {
-
-                    PROXY_LIST_AUTH.clear();
-
-                    PROXY_LIST_AUTH.putAll(custom_clean_list_auth);
-                }
-
+            if (!"https".equalsIgnoreCase(url.getProtocol())) {
+                LOG.log(Level.WARNING, "Smart proxy list URL is not HTTPS ({0}); response is unauthenticated and could be MITM'd", url_str);
             }
 
-            // If the user provided no custom list (or it was empty), we still want to surface /wireguard configs.
-            if (custom_proxy_list == null) {
-                loadWireguardConfigs(custom_clean_list);
-                if (!custom_clean_list.isEmpty()) {
-                    _proxy_list.clear();
-                    _proxy_list.putAll(custom_clean_list);
-                }
+            con = (HttpURLConnection) url.openConnection();
+            con.setUseCaches(false);
+            con.setRequestProperty("User-Agent", MainPanel.DEFAULT_USER_AGENT);
+
+            // Bound the fetch. Without timeouts a hung proxy-list URL holds
+            // the SmartMegaProxyManager monitor (synchronized method) and
+            // blocks every getProxy() / blockProxy() call across all
+            // workers -- exactly the wrong time to stall, since we're
+            // already in 509 recovery. (#751)
+            con.setConnectTimeout(15_000);
+            con.setReadTimeout(30_000);
+
+            int http_status = con.getResponseCode();
+            if (http_status != 200) {
+                MiscTools.drainAndCloseErrorStream(con);
+                throw new IOException("HTTP " + http_status);
             }
 
-            if (custom_clean_list.isEmpty() && _proxy_list_url != null && !"".equals(_proxy_list_url)) {
-
-                URL url = new URL(this._proxy_list_url);
-
-                if (!"https".equalsIgnoreCase(url.getProtocol())) {
-                    LOG.log(Level.WARNING, "Smart proxy list URL is not HTTPS ({0}); response is unauthenticated and could be MITM'd", url.toString());
+            String data;
+            try (InputStream is = con.getInputStream(); ByteArrayOutputStream byte_res = new ByteArrayOutputStream()) {
+                byte[] buffer = new byte[MainPanel.DEFAULT_BYTE_BUFFER_SIZE];
+                int reads;
+                while ((reads = is.read(buffer)) != -1) {
+                    byte_res.write(buffer, 0, reads);
                 }
-
-                con = (HttpURLConnection) url.openConnection();
-
-                con.setUseCaches(false);
-
-                con.setRequestProperty("User-Agent", MainPanel.DEFAULT_USER_AGENT);
-
-                if (con.getResponseCode() != 200) {
-
-                    LOG.log(Level.WARNING, "Smart proxy list fetch failed: HTTP {0}", con.getResponseCode());
-
-                    MiscTools.drainAndCloseErrorStream(con);
-
-                    data = "";
-
-                } else {
-
-                    try (InputStream is = con.getInputStream(); ByteArrayOutputStream byte_res = new ByteArrayOutputStream()) {
-
-                        byte[] buffer = new byte[MainPanel.DEFAULT_BYTE_BUFFER_SIZE];
-
-                        int reads;
-
-                        while ((reads = is.read(buffer)) != -1) {
-
-                            byte_res.write(buffer, 0, reads);
-                        }
-
-                        data = new String(byte_res.toByteArray(), "UTF-8");
-                    }
-                }
-
-                String[] proxy_list = data.split("\n");
-
-                if (proxy_list.length > 0) {
-
-                    LinkedHashMap<String, Long[]> url_clean_list = new LinkedHashMap<>();
-
-                    HashMap<String, String> url_clean_list_auth = new HashMap<>();
-
-                    for (String proxy : proxy_list) {
-
-                        if (proxy == null) {
-                            continue;
-                        }
-
-                        proxy = proxy.trim();
-
-                        if (proxy.isEmpty()) {
-                            continue;
-                        }
-
-                        if (proxy.toLowerCase().startsWith("ikev2://") || proxy.toLowerCase().startsWith("ikev2 ") || proxy.toLowerCase().startsWith("ikev2:")) {
-                            Ikev2Credentials creds = parseIkev2Credentials(proxy);
-                            if (creds != null) {
-                                String key = "ikev2://" + creds.username + "@" + creds.hostname;
-                                Long[] proxy_data = new Long[]{-1L, 2L};
-                                url_clean_list.put(key, proxy_data);
-                                IKEV2_AUTH.put(key, creds);
-                            }
-                            continue;
-                        }
-
-                        boolean socks = false;
-
-                        if (proxy.startsWith("*")) {
-                            socks = true;
-
-                            proxy = proxy.substring(1).trim();
-                        }
-
-                        if (proxy.contains("@")) {
-
-                            String[] proxy_parts = proxy.split("@");
-
-                            if (proxy_parts.length < 2) {
-                                continue;
-                            }
-
-                            String proxy_key = proxy_parts[0].trim();
-                            String proxy_auth = proxy_parts[1].trim();
-
-                            if (proxy_key.isEmpty()) {
-                                continue;
-                            }
-
-                            url_clean_list_auth.put(proxy_key, proxy_auth);
-
-                            Long[] proxy_data = new Long[]{-1L, socks ? 1L : -1L};
-
-                            url_clean_list.put(proxy_key, proxy_data);
-
-                        } else if (proxy.matches(".+?:[0-9]{1,5}")) {
-                            Long[] proxy_data = new Long[]{-1L, socks ? 1L : -1L};
-                            url_clean_list.put(proxy, proxy_data);
-                        }
-
-                    }
-
-                    // Auto-load WireGuard configs from /wireguard (Docker volume)
-                    loadWireguardConfigs(url_clean_list);
-
-                    _proxy_list.clear();
-
-                    _proxy_list.putAll(url_clean_list);
-
-                    PROXY_LIST_AUTH.clear();
-
-                    PROXY_LIST_AUTH.putAll(url_clean_list_auth);
-                }
-
-                _main_panel.getView().updateSmartProxyStatus("SmartProxy: ON (" + String.valueOf(getProxyCount()) + ")" + (this.isForce_smart_proxy() ? " F!" : ""));
-
-                LOG.log(Level.FINE, "{0} Smart Proxy Manager: proxy list refreshed ({1})", new Object[]{Thread.currentThread().getName(), _proxy_list.size()});
-
-            } else if (!custom_clean_list.isEmpty()) {
-
-                _main_panel.getView().updateSmartProxyStatus("SmartProxy: ON (" + String.valueOf(getProxyCount()) + ")" + (this.isForce_smart_proxy() ? " F!" : ""));
-
-                LOG.log(Level.FINE, "{0} Smart Proxy Manager: proxy list refreshed ({1})", new Object[]{Thread.currentThread().getName(), _proxy_list.size()});
-            } else {
-                _main_panel.getView().updateSmartProxyStatus("SmartProxy: ON (0 proxies!)" + (this.isForce_smart_proxy() ? " F!" : ""));
-                LOG.log(Level.INFO, "{0} Smart Proxy Manager: NO PROXYS");
+                data = new String(byte_res.toByteArray(), "UTF-8");
             }
 
-        } catch (MalformedURLException ex) {
-            LOG.log(Level.SEVERE, ex.getMessage());
-        } catch (IOException ex) {
-            LOG.log(Level.SEVERE, ex.getMessage());
+            for (String line : data.split("\n")) {
+                parseProxyEntry(line, "URL", into_list, into_auth);
+            }
         } finally {
             if (con != null) {
                 con.disconnect();
             }
-
         }
+    }
 
-        _last_refresh_timestamp = System.currentTimeMillis();
+    /**
+     * Refreshes the live proxy pool from {@code custom_proxy_list}. The
+     * textarea is scanned line by line:
+     * <ul>
+     *   <li>Lines starting with {@code #} followed by {@code http://} or
+     *       {@code https://} are treated as remote proxy-list URLs. ALL
+     *       such lines are fetched and the entries aggregated. (#753)</li>
+     *   <li>Other non-empty lines are parsed as inline proxy entries by
+     *       {@link #parseProxyEntry}.</li>
+     * </ul>
+     * Inline entries and URL-sourced entries coexist; a single failed URL
+     * does not invalidate the rest. The live pool is only swapped if the
+     * resulting set has at least one entry — otherwise the previous list
+     * is preserved and the status label is marked {@code "stale"}. (#751)
+     */
+    public synchronized void refreshProxyList() {
 
+        try {
+            String custom_proxy_list = DBTools.selectSettingValue("custom_proxy_list");
+
+            LinkedHashMap<String, Long[]> new_list = new LinkedHashMap<>();
+            HashMap<String, String> new_auth = new HashMap<>();
+            ArrayList<String> urls = new ArrayList<>();
+            boolean had_input = false;
+
+            IKEV2_AUTH.clear();
+            WIREGUARD_CONFIGS.clear();
+            loadWireguardConfigs(new_list);
+
+            if (custom_proxy_list != null) {
+                for (String line : custom_proxy_list.split("\\r?\\n")) {
+                    String trimmed = line.trim();
+                    if (trimmed.isEmpty()) {
+                        continue;
+                    }
+                    had_input = true;
+                    if (trimmed.startsWith("#")) {
+                        // Strip the '#' and accept either '#http://...' or
+                        // '# http://...' so users aren't tripped up by a
+                        // stray space.
+                        String url_part = trimmed.substring(1).trim();
+                        String lower = url_part.toLowerCase();
+                        if (lower.startsWith("http://") || lower.startsWith("https://")) {
+                            urls.add(url_part);
+                        } else if (!url_part.isEmpty()) {
+                            LOG.log(Level.WARNING, "[Smart Proxy] skipping malformed #URL entry: {0}", line);
+                        }
+                    } else {
+                        parseProxyEntry(line, "custom", new_list, new_auth);
+                    }
+                }
+            }
+
+            int urls_ok = 0;
+            int urls_fail = 0;
+            for (String u : urls) {
+                try {
+                    fetchAndMerge(u, new_list, new_auth);
+                    urls_ok++;
+                } catch (MalformedURLException ex) {
+                    urls_fail++;
+                    LOG.log(Level.SEVERE, "[Smart Proxy] proxy-list URL is malformed ({0}): {1}", new Object[]{u, ex.getMessage()});
+                } catch (IOException ex) {
+                    urls_fail++;
+                    LOG.log(Level.WARNING, "[Smart Proxy] proxy-list URL fetch failed ({0}) -- continuing with remaining sources: {1}",
+                            new Object[]{u, ex.getMessage()});
+                }
+            }
+
+            if (new_list.isEmpty()) {
+                // Preserve previous list. Was: clear() + populate during
+                // parse, so an empty / garbage body wiped the previous list
+                // before we knew whether the new one was viable. (#751)
+                if (had_input) {
+                    LOG.log(Level.WARNING, "[Smart Proxy] refresh produced 0 entries (URLs ok={0}, failed={1}) -- preserving previous list ({2} entries)",
+                            new Object[]{urls_ok, urls_fail, _proxy_list.size()});
+                    _main_panel.getView().updateSmartProxyStatus("SmartProxy: ON (" + String.valueOf(getProxyCount()) + " stale)" + (this.isForce_smart_proxy() ? " F!" : ""));
+                } else {
+                    _main_panel.getView().updateSmartProxyStatus("SmartProxy: ON (0 proxies!)" + (this.isForce_smart_proxy() ? " F!" : ""));
+                    LOG.log(Level.INFO, "[Smart Proxy] no inline entries and no URLs configured");
+                }
+            } else {
+                _proxy_list.clear();
+                _proxy_list.putAll(new_list);
+                PROXY_LIST_AUTH.clear();
+                PROXY_LIST_AUTH.putAll(new_auth);
+
+                // When SOME URLs failed but we still got a usable pool, show
+                // the partial-success state so the user can tell one of
+                // their providers is sick without having to read the log.
+                String suffix = "";
+                if (urls_fail > 0) {
+                    suffix = " [" + urls_ok + "/" + (urls_ok + urls_fail) + " sources]";
+                }
+                _main_panel.getView().updateSmartProxyStatus("SmartProxy: ON (" + String.valueOf(getProxyCount()) + ")" + suffix + (this.isForce_smart_proxy() ? " F!" : ""));
+                LOG.log(Level.INFO, "[Smart Proxy] proxy list refreshed ({0} entries; URLs ok={1}, failed={2})",
+                        new Object[]{_proxy_list.size(), urls_ok, urls_fail});
+            }
+        } finally {
+            _last_refresh_timestamp = System.currentTimeMillis();
+        }
     }
 
     public static class SmartProxyAuthenticator extends Authenticator {

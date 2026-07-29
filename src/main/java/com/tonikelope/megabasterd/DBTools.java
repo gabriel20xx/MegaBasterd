@@ -196,10 +196,10 @@ public class DBTools {
     /**
      * Variant that returns the filename actually persisted to DB. When the
      * UNIQUE(path, filename) constraint trips (two MEGA files with the same
-     * display name to the same dir), retries up to 50 times appending a
-     * random suffix. Caller MUST use the returned name when computing the
-     * on-disk path -- otherwise the DB row and the file written to disk
-     * disagree and two concurrent downloads clobber the same .mctemp. #719.
+     * display name to the same dir), retries up to 50 times appending a random
+     * suffix. Caller MUST use the returned name when computing the on-disk path
+     * -- otherwise the DB row and the file written to disk disagree and two
+     * concurrent downloads clobber the same .mctemp. #719.
      */
     public static synchronized String insertDownloadReturningName(String url, String email, String path, String filename, String filekey, Long size, String filepass, String filenoexpire, String custom_chunks_dir) throws SQLException {
 
@@ -384,6 +384,22 @@ public class DBTools {
         }
 
         return value;
+    }
+
+    // Returns true only when the settings table contains zero rows. On error
+    // returns false so callers default to the safe "not a first run" path
+    // (issue #771 first-run language autodetection).
+    public static synchronized boolean isSettingsTableEmpty() {
+
+        try (Connection conn = SqliteSingleton.getInstance().getConn(); PreparedStatement ps = conn.prepareStatement("SELECT 1 FROM settings LIMIT 1")) {
+
+            ResultSet res = ps.executeQuery();
+
+            return !res.next();
+        } catch (SQLException ex) {
+            Logger.getLogger(DBTools.class.getName()).log(Level.SEVERE, ex.getMessage());
+            return false;
+        }
     }
 
     public static synchronized void insertSettingValue(String key, String value) throws SQLException {

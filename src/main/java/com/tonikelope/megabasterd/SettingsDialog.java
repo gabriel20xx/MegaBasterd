@@ -18,7 +18,6 @@ import java.awt.Dialog;
 import java.awt.Frame;
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
-import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
@@ -29,9 +28,6 @@ import java.io.ObjectOutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.security.InvalidAlgorithmParameterException;
-import java.security.InvalidKeyException;
-import java.security.NoSuchAlgorithmException;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -45,9 +41,6 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
-import javax.crypto.BadPaddingException;
-import javax.crypto.IllegalBlockSizeException;
-import javax.crypto.NoSuchPaddingException;
 import javax.swing.DefaultRowSorter;
 import javax.swing.JFileChooser;
 import javax.swing.JOptionPane;
@@ -77,8 +70,16 @@ public class SettingsDialog extends javax.swing.JDialog {
     private final Set<String> _deleted_mega_accounts;
     private final Set<String> _deleted_elc_accounts;
     private final MainPanel _main_panel;
+    private final AccountStore _account_store;
     private boolean _remember_master_pass;
     private volatile boolean _exit = false;
+    // SmartProxy 509 / quota recovery panel. Inserted as the second tab in
+    // panel_tabs (between Downloads and Uploads) at construction time
+    // (programmatically, no .form change). Owns its own load/save against
+    // the DB; saveToDB() is invoked from save_buttonActionPerformed, and
+    // shutdown() runs on dispose() so any in-flight TCP probes are cancelled
+    // instead of blocking the JVM. (#757)
+    private QuotaRecoveryPanel _quota_recovery_panel;
 
     public boolean isSettings_ok() {
         return _settings_ok;
@@ -96,11 +97,99 @@ public class SettingsDialog extends javax.swing.JDialog {
         return _remember_master_pass;
     }
 
+    @Override
+    public void dispose() {
+        // Cancel any in-flight TCP probes the user kicked off in the quota
+        // recovery tab; otherwise the JVM waits up to ~3 s per outstanding
+        // connect before exiting. Safe to call even if no test ran. (#757)
+        if (_quota_recovery_panel != null) {
+            _quota_recovery_panel.shutdown();
+        }
+        super.dispose();
+    }
+
+    /**
+     * Fill the MEGA / ELC table models from AccountStore.listMegaPlaintext /
+     * listElcPlaintext. Must NOT be called when the store is locked -- callers
+     * are responsible for taking the placeholder-row branch instead.
+     */
+    private void _populateAccountTablesFromStore(DefaultTableModel mega_model, DefaultTableModel elc_model) {
+        try {
+            for (Map.Entry<String, String> e : _account_store.listMegaPlaintext().entrySet()) {
+                mega_model.addRow(new String[]{e.getKey(), e.getValue()});
+            }
+            for (Map.Entry<String, String[]> e : _account_store.listElcPlaintext().entrySet()) {
+                elc_model.addRow(new String[]{e.getKey(), e.getValue()[0], e.getValue()[1]});
+            }
+        } catch (Exception ex) {
+            LOG.log(Level.SEVERE, "Populating account tables from store: {0}", ex.getMessage());
+        }
+    }
+
+    /**
+     * 2FA + login + persist for one MEGA account row. Used by the save loop for
+     * both brand-new accounts and existing accounts whose stored password
+     * differs from what the user typed in the table.
+     *
+     * <p>
+     * Short-circuits if the account already has an active session in
+     * {@link MainPanel#getMega_active_accounts()}. This preserves the legacy
+     * behaviour where an active session means "the user already authenticated
+     * via some other path; don't re-prompt".
+     *
+     * @return true if the account is now persisted (or was already active),
+     * false on login failure or 2FA cancellation
+     */
+    private boolean _loginAndPersistMegaAccount(String email, String plaintextPass, Dialog ownerDialog) {
+
+        if (_main_panel.getMega_active_accounts().containsKey(email)) {
+            return true;
+        }
+
+        MegaAPI ma = new MegaAPI();
+
+        try {
+            String pincode = null;
+
+            if (ma.check2FA(email)) {
+
+                final String[] code_holder = {null};
+                final boolean[] cancelled = {false};
+
+                MiscTools.GUIRunAndWait(() -> {
+                    Get2FACode dialog = new Get2FACode((Frame) getParent(), true, email, _main_panel);
+                    dialog.setLocationRelativeTo(ownerDialog);
+                    dialog.setVisible(true);
+                    if (dialog.isCode_ok()) {
+                        code_holder[0] = dialog.getPin_code();
+                    } else {
+                        cancelled[0] = true;
+                    }
+                });
+
+                if (cancelled[0]) {
+                    return false;
+                }
+                pincode = code_holder[0];
+            }
+
+            ma.login(email, plaintextPass, pincode);
+            _account_store.persistMegaLogin(email, plaintextPass, ma);
+            return true;
+
+        } catch (Exception ex) {
+            LOG.log(Level.SEVERE, "MEGA login/persist for {0}: {1}", new Object[]{email, ex.getMessage()});
+            return false;
+        }
+    }
+
     public SettingsDialog(MainPanelView parent, boolean modal) {
 
         super(parent, modal);
 
         _main_panel = parent.getMain_panel();
+
+        _account_store = new AccountStore(_main_panel);
 
         _remember_master_pass = true;
 
@@ -129,6 +218,156 @@ public class SettingsDialog extends javax.swing.JDialog {
             panel_tabs.setTitleAt(2, LabelTranslatorSingleton.getInstance().translate("Accounts"));
 
             panel_tabs.setTitleAt(3, LabelTranslatorSingleton.getInstance().translate("Advanced"));
+
+            // Build the unified "SmartProxy" tab and insert it at index 1
+            // (between Downloads and Uploads).
+            //
+            // It stacks (top to bottom):
+            //   1. smart_proxy_checkbox  -- master ON/OFF toggle for SmartProxy
+            //   2. smart_proxy_settings  -- the proxy list + ban time + timeout
+            //                               + force + auto-refresh + random/seq
+            //                               + reset-on-success panel
+            //   3. QuotaRecoveryPanel    -- 509 recovery (auto-resume on IP
+            //                               change, stall timeout, post-509
+            //                               recheck window) plus the proxy Test
+            //                               diagnostics (current IP, Test,
+            //                               Concurrent probes, Save working).
+            //
+            // Components (1) and (2) used to live in the Downloads tab; their
+            // references in the Downloads layout were removed from both the
+            // .form XML and the matching initComponents code so the orphan
+            // components can be reparented here without GroupLayout fighting
+            // back (a missing component still referenced by a Group throws an
+            // NPE on layoutContainer). All their event handlers, fonts and
+            // translations were applied before this code runs, and survive
+            // the re-parent because the same references are used. (#757)
+            //
+            // The setTitleAt calls above run BEFORE this insertion so the
+            // indices they use (0..3) still point to the .form-original tabs
+            // at the moment they execute -- after insertTab the existing tabs
+            // shift to 0, 2, 3, 4 but they were already labelled correctly.
+            _quota_recovery_panel = new QuotaRecoveryPanel(_main_panel);
+
+            // Force LEFT alignment so a small JCheckBox doesn't render
+            // off-centre relative to the wider JPanels (BoxLayout otherwise
+            // uses each component's getAlignmentX(), which defaults differ
+            // between widget types).
+            smart_proxy_checkbox.setAlignmentX(java.awt.Component.LEFT_ALIGNMENT);
+            smart_proxy_settings.setAlignmentX(java.awt.Component.LEFT_ALIGNMENT);
+            _quota_recovery_panel.setAlignmentX(java.awt.Component.LEFT_ALIGNMENT);
+
+            // Compact the proxy-list textarea: 5 rows of 18 pt font was
+            // ~150 px of vertical real-estate dominating the panel, AND when
+            // the mouse hovered the textarea its own scroll captured every
+            // wheel event so the surrounding tab could not scroll. Shrink
+            // to 3 rows and delegate wheel events to the outer JScrollPane
+            // whenever the textarea cannot itself scroll in the wheeled
+            // direction (content fits, or at top/bottom boundary). Inner
+            // scroll still works for in-textarea content overflow. (#758)
+            custom_proxy_textarea.setRows(3);
+            jScrollPane1.setPreferredSize(new java.awt.Dimension(jScrollPane1.getPreferredSize().width, 110));
+            jScrollPane1.addMouseWheelListener(e -> {
+                javax.swing.JScrollBar inner = jScrollPane1.getVerticalScrollBar();
+                boolean cannot_scroll_self = inner.getMaximum() - inner.getMinimum() <= inner.getVisibleAmount();
+                boolean at_top = inner.getValue() <= inner.getMinimum();
+                boolean at_bottom = inner.getValue() + inner.getVisibleAmount() >= inner.getMaximum();
+                int dir = e.getWheelRotation();
+                boolean overflow_up = at_top && dir < 0;
+                boolean overflow_down = at_bottom && dir > 0;
+                if (cannot_scroll_self || overflow_up || overflow_down) {
+                    // Drive the closest ancestor JScrollPane's vertical bar
+                    // directly instead of trying to re-dispatch the event
+                    // (SwingUtilities.convertMouseEvent on a MouseWheelEvent
+                    // returns a plain MouseEvent and loses the wheel rotation).
+                    java.awt.Container anc = javax.swing.SwingUtilities.getAncestorOfClass(javax.swing.JScrollPane.class, jScrollPane1.getParent());
+                    if (anc instanceof javax.swing.JScrollPane) {
+                        javax.swing.JScrollBar outer_bar = ((javax.swing.JScrollPane) anc).getVerticalScrollBar();
+                        int delta = e.getUnitsToScroll() * outer_bar.getUnitIncrement();
+                        outer_bar.setValue(outer_bar.getValue() + delta);
+                    }
+                }
+            });
+
+            javax.swing.JPanel proxy_tab_content = new javax.swing.JPanel();
+            proxy_tab_content.setLayout(new javax.swing.BoxLayout(proxy_tab_content, javax.swing.BoxLayout.Y_AXIS));
+            proxy_tab_content.setBorder(javax.swing.BorderFactory.createEmptyBorder(8, 8, 8, 8));
+            proxy_tab_content.add(smart_proxy_checkbox);
+            proxy_tab_content.add(javax.swing.Box.createVerticalStrut(6));
+            proxy_tab_content.add(smart_proxy_settings);
+            proxy_tab_content.add(javax.swing.Box.createVerticalStrut(6));
+
+            // Manual proxy-list refresh button. Useful when the auto-refresh
+            // timer (default 30 min) is too slow -- e.g. the user just
+            // pasted a fresh #URL feed and wants the pool to re-fetch
+            // immediately, or the live pool has been exhausted by 429 / 509
+            // and they want to retry the same URLs without waiting. Runs on
+            // THREAD_POOL because refreshProxyList() does network IO; calling
+            // it on the EDT would freeze the UI for the HTTP roundtrip. The
+            // button stays clickable while the refresh runs; back-to-back
+            // clicks just queue extra refreshes which collapse on the
+            // manager's `synchronized` monitor. (#758)
+            javax.swing.JPanel refresh_row = new javax.swing.JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 0, 0));
+            refresh_row.setAlignmentX(java.awt.Component.LEFT_ALIGNMENT);
+            javax.swing.JButton refresh_proxy_button = new javax.swing.JButton(I18n.tr("ui.smartproxy.refresh_now"));
+            refresh_proxy_button.setToolTipText(I18n.tr("ui.smartproxy.refresh_now.tooltip"));
+            refresh_proxy_button.addActionListener(e -> {
+                SmartMegaProxyManager pm = MainPanel.getProxy_manager();
+                if (pm != null) {
+                    MainPanel.THREAD_POOL.execute(pm::refreshProxyList);
+                }
+            });
+            refresh_row.add(refresh_proxy_button);
+            proxy_tab_content.add(refresh_row);
+
+            proxy_tab_content.add(javax.swing.Box.createVerticalStrut(12));
+            proxy_tab_content.add(_quota_recovery_panel);
+
+            javax.swing.JScrollPane proxy_scroll = new javax.swing.JScrollPane(proxy_tab_content);
+            proxy_scroll.getVerticalScrollBar().setUnitIncrement(20);
+            proxy_scroll.getHorizontalScrollBar().setUnitIncrement(20);
+            proxy_scroll.setBorder(null);
+
+            javax.swing.ImageIcon proxy_icon = new javax.swing.ImageIcon(getClass().getResource("/images/icons8-services-30.png"));
+            panel_tabs.insertTab(I18n.tr("ui.tab.smartproxy"), proxy_icon, proxy_scroll, null, 1);
+
+            // updateFonts(this, ...) and translateLabels(this) ran at the top
+            // of this constructor BEFORE smart_proxy_checkbox and
+            // smart_proxy_settings had any parent (they were detached from
+            // Downloads at the .form level), so the dialog-wide tree-walks
+            // skipped them and they kept their raw 18 pt initComponents fonts
+            // / untranslated English text. Apply both transforms now, scoped
+            // to just the two orphans so QuotaRecoveryPanel (which font/
+            // translated itself in its own constructor) is not processed
+            // twice -- translateLabels is NOT idempotent (a second pass over
+            // already-translated text either re-translates via a coincidental
+            // map entry or returns it unchanged, depending on the locale).
+            // (#757)
+            MiscTools.updateFonts(smart_proxy_checkbox, GUI_FONT, _main_panel.getZoom_factor());
+            MiscTools.updateFonts(smart_proxy_settings, GUI_FONT, _main_panel.getZoom_factor());
+            translateLabels(smart_proxy_checkbox);
+            translateLabels(smart_proxy_settings);
+
+            // The WARNING label sits on a single .form-defined JLabel so any
+            // long translation overflows the dialog horizontally. Re-emit the
+            // text wrapped in <html>...</html> with literal \n converted to
+            // <br> so translators can break the WARNING into multiple lines
+            // by placing \n in their messages_XX.properties value (#770).
+            String warn = LabelTranslatorSingleton.getInstance().translate("WARNING: Using proxies or VPN to bypass MEGA's daily download limitation may violate its Terms of Use. USE THIS OPTION AT YOUR OWN RISK.");
+            rec_smart_proxy_label1.setText("<html>" + warn.replace("\n", "<br>") + "</html>");
+
+            // JTable column headers are NOT visited by translateLabels (it
+            // only walks JLabel/AbstractButton subtypes), so the ELC and MEGA
+            // account-table headers ship in raw English. Apply translations
+            // explicitly here, once the model has been initialised by
+            // initComponents (#770).
+            translateAccountTableHeaders();
+
+            // The Refresh-now button + row are brand-new components built
+            // above; apply GUI_FONT scaled by zoom so they match the rest of
+            // the dialog. No translateLabels call needed -- the button text
+            // and tooltip were already passed through I18n.tr at construction
+            // time. (#758)
+            MiscTools.updateFonts(refresh_row, GUI_FONT, _main_panel.getZoom_factor());
 
             downloads_scrollpane.getVerticalScrollBar().setUnitIncrement(20);
 
@@ -201,6 +440,14 @@ public class SettingsDialog extends javax.swing.JDialog {
                 monitor_clipboard = monitor_clipboard_string.equals("yes");
             }
 
+            boolean always_reload_mega_folders = false;
+
+            String always_reload_mega_folders_string = DBTools.selectSettingValue("always_reload_mega_folders");
+
+            if (always_reload_mega_folders_string != null) {
+                always_reload_mega_folders = always_reload_mega_folders_string.equals("yes");
+            }
+
             boolean thumbnails = Upload.DEFAULT_THUMBNAILS;
 
             String thumbnails_string = DBTools.selectSettingValue("thumbnails");
@@ -236,6 +483,8 @@ public class SettingsDialog extends javax.swing.JDialog {
             this.public_folder_panel.setVisible(this.upload_public_folder_checkbox.isSelected());
 
             clipboardspy_checkbox.setSelected(monitor_clipboard);
+
+            always_reload_mega_folders_checkbox.setSelected(always_reload_mega_folders);
 
             String default_download_dir = DBTools.selectSettingValue("default_down_dir");
 
@@ -342,29 +591,71 @@ public class SettingsDialog extends javax.swing.JDialog {
 
             ((JSpinner.DefaultEditor) auto_refresh_proxy_time_spinner.getEditor()).getTextField().setEditable(true);
 
+            // Explicit cross-reference tooltip: users have confused this
+            // spinner with the post-509 SmartProxy window in the Quota
+            // Recovery dialog (Edit menu), since both look like "time
+            // before something happens to the proxy". Spell out the
+            // difference here. (#753)
+            String refresh_tip = I18n.tr("settings.smartproxy.refresh.tooltip");
+            jLabel8.setToolTipText(refresh_tip);
+            auto_refresh_proxy_time_spinner.setToolTipText(refresh_tip);
+
             String smartproxy_ban_time = DBTools.selectSettingValue("smartproxy_ban_time");
 
             int smartproxy_ban_time_int = PROXY_BLOCK_TIME;
 
             if (smartproxy_ban_time != null) {
-                smartproxy_ban_time_int = Integer.parseInt(smartproxy_ban_time);
+                try {
+                    smartproxy_ban_time_int = Integer.parseInt(smartproxy_ban_time);
+                } catch (NumberFormatException ignore) {
+                    // Fall back to default; the manager defends itself anyway.
+                }
             }
 
-            bad_proxy_time_spinner.setModel(new SpinnerNumberModel(smartproxy_ban_time_int, 0, Integer.MAX_VALUE, 1));
+            // Range mirrors SmartMegaProxyManager.refreshSmartProxySettings():
+            //   0       = permanent ban
+            //   1..9    = honoured but risky (logged as WARNING by the manager)
+            //   10..3600 = normal
+            // Anything outside [0, 3600] previously stored in the DB is clamped
+            // here so the spinner round-trips a sane value back to disk. (#757)
+            if (smartproxy_ban_time_int < 0) {
+                smartproxy_ban_time_int = 0;
+            } else if (smartproxy_ban_time_int > 3600) {
+                smartproxy_ban_time_int = 3600;
+            }
+            bad_proxy_time_spinner.setModel(new SpinnerNumberModel(smartproxy_ban_time_int, 0, 3600, 1));
 
             ((JSpinner.DefaultEditor) bad_proxy_time_spinner.getEditor()).getTextField().setEditable(true);
+            bad_proxy_time_spinner.setToolTipText(I18n.tr("settings.smartproxy.ban_time.tooltip"));
 
             String smartproxy_timeout = DBTools.selectSettingValue("smartproxy_timeout");
 
             int smartproxy_timeout_int = (int) ((float) Transference.HTTP_PROXY_TIMEOUT / 1000);
 
             if (smartproxy_timeout != null) {
-                smartproxy_timeout_int = Integer.parseInt(smartproxy_timeout);
+                try {
+                    smartproxy_timeout_int = Integer.parseInt(smartproxy_timeout);
+                } catch (NumberFormatException ignore) {
+                    // Fall back to default; the manager defends itself anyway.
+                }
             }
 
-            proxy_timeout_spinner.setModel(new SpinnerNumberModel(smartproxy_timeout_int, 1, Integer.MAX_VALUE, 1));
+            // Range mirrors SmartMegaProxyManager.refreshSmartProxySettings()'s
+            // clamp [3, 120]. Below 3 s most real-world public proxies cannot
+            // complete a TCP+TLS handshake; above 120 s the worker burns the
+            // backoff timer waiting on a single dead proxy. Out-of-range DB
+            // values from older installs get clamped on load so the spinner
+            // round-trips a sane value back to disk. (#758 -- mirrors the
+            // ban_time spinner tightening from #757.)
+            if (smartproxy_timeout_int < 3) {
+                smartproxy_timeout_int = 3;
+            } else if (smartproxy_timeout_int > 120) {
+                smartproxy_timeout_int = 120;
+            }
+            proxy_timeout_spinner.setModel(new SpinnerNumberModel(smartproxy_timeout_int, 3, 120, 1));
 
             ((JSpinner.DefaultEditor) proxy_timeout_spinner.getEditor()).getTextField().setEditable(true);
+            proxy_timeout_spinner.setToolTipText(I18n.tr("settings.smartproxy.timeout.tooltip"));
 
             boolean reset_slot_proxy = SmartMegaProxyManager.RESET_SLOT_PROXY;
 
@@ -512,53 +803,7 @@ public class SettingsDialog extends javax.swing.JDialog {
 
                     unlock_accounts_button.setVisible(false);
 
-                    for (Map.Entry pair : _main_panel.getMega_accounts().entrySet()) {
-
-                        HashMap<String, Object> data = (HashMap) pair.getValue();
-
-                        String pass = null;
-
-                        try {
-
-                            pass = new String(CryptTools.aes_cbc_decrypt_at_rest(BASE642Bin((String) data.get("password")), _main_panel.getMaster_pass()), "UTF-8");
-
-                        } catch (NoSuchAlgorithmException | NoSuchPaddingException | InvalidKeyException | InvalidAlgorithmParameterException | IllegalBlockSizeException | BadPaddingException ex) {
-                            LOG.log(Level.SEVERE, ex.getMessage());
-                        } catch (Exception ex) {
-                            LOG.log(Level.SEVERE, ex.getMessage());
-                        }
-
-                        String[] new_row_data = {(String) pair.getKey(), pass};
-
-                        mega_model.addRow(new_row_data);
-                    }
-
-                    for (Map.Entry pair : _main_panel.getElc_accounts().entrySet()) {
-
-                        HashMap<String, Object> data = (HashMap) pair.getValue();
-
-                        String user = null, apikey = null;
-
-                        try {
-
-                            user = new String(CryptTools.aes_cbc_decrypt_at_rest(BASE642Bin((String) data.get("user")), _main_panel.getMaster_pass()), "UTF-8");
-
-                            apikey = new String(CryptTools.aes_cbc_decrypt_at_rest(BASE642Bin((String) data.get("apikey")), _main_panel.getMaster_pass()), "UTF-8");
-
-                        } catch (NoSuchAlgorithmException | NoSuchPaddingException | InvalidKeyException | InvalidAlgorithmParameterException | IllegalBlockSizeException | BadPaddingException ex) {
-                            LOG.log(Level.SEVERE, ex.getMessage());
-                        } catch (Exception ex) {
-                            LOG.log(Level.SEVERE, ex.getMessage());
-                        }
-
-                        String[] new_row_data = {(String) pair.getKey(), user, apikey};
-
-                        elc_model.addRow(new_row_data);
-                    }
-
-                    mega_model = (DefaultTableModel) mega_accounts_table.getModel();
-
-                    elc_model = (DefaultTableModel) elc_accounts_table.getModel();
+                    _populateAccountTablesFromStore(mega_model, elc_model);
 
                     remove_mega_account_button.setEnabled(mega_model.getRowCount() > 0);
 
@@ -570,23 +815,7 @@ public class SettingsDialog extends javax.swing.JDialog {
 
                 unlock_accounts_button.setVisible(false);
 
-                for (Map.Entry pair : _main_panel.getMega_accounts().entrySet()) {
-
-                    HashMap<String, Object> data = (HashMap) pair.getValue();
-
-                    String[] new_row_data = {(String) pair.getKey(), (String) data.get("password")};
-
-                    mega_model.addRow(new_row_data);
-                }
-
-                for (Map.Entry pair : _main_panel.getElc_accounts().entrySet()) {
-
-                    HashMap<String, Object> data = (HashMap) pair.getValue();
-
-                    String[] new_row_data = {(String) pair.getKey(), (String) data.get("user"), (String) data.get("apikey")};
-
-                    elc_model.addRow(new_row_data);
-                }
+                _populateAccountTablesFromStore(mega_model, elc_model);
 
                 remove_mega_account_button.setEnabled((mega_model.getRowCount() > 0));
 
@@ -654,6 +883,14 @@ public class SettingsDialog extends javax.swing.JDialog {
 
             force_smart_proxy_checkbox.setSelected(force_smart_proxy);
 
+            // Users routinely report "downloads stall with live proxies" when
+            // FORCE is OFF: SmartProxy is passive by design and only kicks in
+            // after MEGA returns HTTP 509 (or while still inside the post-509
+            // recheck window). The tooltip makes that explicit so the user can
+            // pick the mode that matches their expectation. (#757 bug 3)
+            String force_tip = I18n.tr("settings.smartproxy.force.tooltip");
+            force_smart_proxy_checkbox.setToolTipText(force_tip);
+
             boolean run_command = false;
 
             String run_command_string = DBTools.selectSettingValue("run_command");
@@ -668,6 +905,26 @@ public class SettingsDialog extends javax.swing.JDialog {
             run_command_textbox.setEnabled(run_command);
 
             run_command_textbox.setText(DBTools.selectSettingValue("run_command_path"));
+
+            // #774 -- post-finish commands (downloads + uploads). Same shape
+            // as the 509 block above, with their own DB keys.
+            boolean run_command_dl_finish = false;
+            String run_command_dl_finish_string = DBTools.selectSettingValue("run_command_dl_finish");
+            if (run_command_dl_finish_string != null) {
+                run_command_dl_finish = run_command_dl_finish_string.equals("yes");
+            }
+            run_command_dl_finish_checkbox.setSelected(run_command_dl_finish);
+            run_command_dl_finish_textbox.setEnabled(run_command_dl_finish);
+            run_command_dl_finish_textbox.setText(DBTools.selectSettingValue("run_command_dl_finish_path"));
+
+            boolean run_command_ul_finish = false;
+            String run_command_ul_finish_string = DBTools.selectSettingValue("run_command_ul_finish");
+            if (run_command_ul_finish_string != null) {
+                run_command_ul_finish = run_command_ul_finish_string.equals("yes");
+            }
+            run_command_ul_finish_checkbox.setSelected(run_command_ul_finish);
+            run_command_ul_finish_textbox.setEnabled(run_command_ul_finish);
+            run_command_ul_finish_textbox.setText(DBTools.selectSettingValue("run_command_ul_finish_path"));
 
             boolean init_paused = false;
 
@@ -698,15 +955,13 @@ public class SettingsDialog extends javax.swing.JDialog {
 
             proxy_pass_textfield.setText(DBTools.selectSettingValue("proxy_pass"));
 
-            boolean debug_file = false;
-
-            String debug_file_val = DBTools.selectSettingValue("debug_file");
-
-            if (debug_file_val != null) {
-                debug_file = (debug_file_val.equals("yes"));
-            }
-
-            debug_file_checkbox.setSelected(debug_file);
+            // The "Save debug info to file" setting has been retired: the
+            // DEBUG LOG tab in the main panel captures everything live and
+            // its "Save to file..." button replaces the toggle. We hide the
+            // generated controls instead of removing them so we don't have
+            // to edit SettingsDialog.form. Any stale DB value is ignored.
+            debug_file_checkbox.setVisible(false);
+            debug_file_path.setVisible(false);
 
             String font = DBTools.selectSettingValue("font");
 
@@ -764,6 +1019,12 @@ public class SettingsDialog extends javax.swing.JDialog {
 
             custom_proxy_textarea.setText(mergeCustomProxyListWithAutoWireguard(custom_proxy_list));
 
+            String external_language_file = DBTools.selectSettingValue("external_language_file");
+
+            if (external_language_file != null) {
+                ext_lang_path_field.setText(external_language_file);
+            }
+
             revalidate();
 
             repaint();
@@ -813,6 +1074,7 @@ public class SettingsDialog extends javax.swing.JDialog {
         megacrypter_reverse_port_spinner = new javax.swing.JSpinner();
         down_dir_label = new javax.swing.JLabel();
         clipboardspy_checkbox = new javax.swing.JCheckBox();
+        always_reload_mega_folders_checkbox = new javax.swing.JCheckBox();
         smart_proxy_settings = new javax.swing.JPanel();
         jLabel5 = new javax.swing.JLabel();
         jLabel3 = new javax.swing.JLabel();
@@ -866,6 +1128,8 @@ public class SettingsDialog extends javax.swing.JDialog {
         add_elc_account_button = new javax.swing.JButton();
         jLabel1 = new javax.swing.JLabel();
         import_mega_button = new javax.swing.JButton();
+        export_mega_button = new javax.swing.JButton();
+        export_elc_button = new javax.swing.JButton();
         advanced_scrollpane = new javax.swing.JScrollPane();
         advanced_panel = new javax.swing.JPanel();
         proxy_panel = new javax.swing.JPanel();
@@ -889,6 +1153,14 @@ public class SettingsDialog extends javax.swing.JDialog {
         run_command_textbox = new javax.swing.JTextField();
         run_command_textbox.addMouseListener(new ContextMenuMouseListener());
         run_command_test_button = new javax.swing.JButton();
+        run_command_dl_finish_checkbox = new javax.swing.JCheckBox();
+        run_command_dl_finish_textbox = new javax.swing.JTextField();
+        run_command_dl_finish_textbox.addMouseListener(new ContextMenuMouseListener());
+        run_command_dl_finish_test_button = new javax.swing.JButton();
+        run_command_ul_finish_checkbox = new javax.swing.JCheckBox();
+        run_command_ul_finish_textbox = new javax.swing.JTextField();
+        run_command_ul_finish_textbox.addMouseListener(new ContextMenuMouseListener());
+        run_command_ul_finish_test_button = new javax.swing.JButton();
         debug_file_checkbox = new javax.swing.JCheckBox();
         jPanel1 = new javax.swing.JPanel();
         jButton1 = new javax.swing.JButton();
@@ -902,6 +1174,10 @@ public class SettingsDialog extends javax.swing.JDialog {
         zoom_label = new javax.swing.JLabel();
         zoom_spinner = new javax.swing.JSpinner();
         dark_mode_checkbox = new javax.swing.JCheckBox();
+        ext_lang_label = new javax.swing.JLabel();
+        ext_lang_path_field = new javax.swing.JTextField();
+        ext_lang_browse_button = new javax.swing.JButton();
+        ext_lang_clear_button = new javax.swing.JButton();
         debug_file_path = new javax.swing.JLabel();
         status = new javax.swing.JLabel();
 
@@ -1056,6 +1332,9 @@ public class SettingsDialog extends javax.swing.JDialog {
         clipboardspy_checkbox.setFont(new java.awt.Font("Dialog", 1, 18)); // NOI18N
         clipboardspy_checkbox.setText("Monitor clipboard looking for new links");
 
+        always_reload_mega_folders_checkbox.setFont(new java.awt.Font("Dialog", 1, 18)); // NOI18N
+        always_reload_mega_folders_checkbox.setText("Always reload MEGA folders instead of using cached folder data");
+
         smart_proxy_settings.setEnabled(false);
 
         jLabel5.setFont(new java.awt.Font("Noto Sans", 1, 16)); // NOI18N
@@ -1091,7 +1370,7 @@ public class SettingsDialog extends javax.swing.JDialog {
         custom_proxy_list_label.setOpaque(true);
 
         rec_smart_proxy_label.setFont(new java.awt.Font("Dialog", 2, 16)); // NOI18N
-        rec_smart_proxy_label.setText("Note1: enable it in order to mitigate bandwidth limit. (Multislot is required) ");
+        rec_smart_proxy_label.setText("Note1: enable it in order to mitigate bandwidth limit. (Multislot is required)");
 
         proxy_timeout_spinner.setFont(new java.awt.Font("Noto Sans", 0, 16)); // NOI18N
         proxy_timeout_spinner.setModel(new javax.swing.SpinnerNumberModel(10, 1, null, 1));
@@ -1103,7 +1382,7 @@ public class SettingsDialog extends javax.swing.JDialog {
         jLabel7.setText("Forces the use of smart proxy even if we still have direct bandwidth available (useful to test proxies)");
 
         jLabel8.setFont(new java.awt.Font("Noto Sans", 1, 16)); // NOI18N
-        jLabel8.setText("Proxy list refresh (minutes):");
+        jLabel8.setText("Re-download proxy list every (minutes):");
 
         auto_refresh_proxy_time_spinner.setFont(new java.awt.Font("Noto Sans", 0, 16)); // NOI18N
         auto_refresh_proxy_time_spinner.setModel(new javax.swing.SpinnerNumberModel(60, 1, null, 1));
@@ -1233,7 +1512,6 @@ public class SettingsDialog extends javax.swing.JDialog {
                     .addGroup(downloads_panelLayout.createSequentialGroup()
                         .addContainerGap()
                         .addGroup(downloads_panelLayout.createParallelGroup(javax.swing.GroupLayout.Alignment.LEADING)
-                            .addComponent(smart_proxy_checkbox)
                             .addGroup(downloads_panelLayout.createSequentialGroup()
                                 .addComponent(max_downloads_label)
                                 .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.RELATED)
@@ -1251,6 +1529,7 @@ public class SettingsDialog extends javax.swing.JDialog {
                             .addComponent(overwrite_existing_files_checkbox)
                             .addComponent(limit_download_speed_checkbox)
                             .addComponent(clipboardspy_checkbox)
+                            .addComponent(always_reload_mega_folders_checkbox)
                             .addGroup(downloads_panelLayout.createSequentialGroup()
                                 .addGap(21, 21, 21)
                                 .addGroup(downloads_panelLayout.createParallelGroup(javax.swing.GroupLayout.Alignment.LEADING)
@@ -1271,10 +1550,7 @@ public class SettingsDialog extends javax.swing.JDialog {
                                     .addGroup(downloads_panelLayout.createSequentialGroup()
                                         .addComponent(max_down_speed_label)
                                         .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.RELATED)
-                                        .addComponent(max_down_speed_spinner, javax.swing.GroupLayout.PREFERRED_SIZE, javax.swing.GroupLayout.DEFAULT_SIZE, javax.swing.GroupLayout.PREFERRED_SIZE))))))
-                    .addGroup(downloads_panelLayout.createSequentialGroup()
-                        .addGap(12, 12, 12)
-                        .addComponent(smart_proxy_settings, javax.swing.GroupLayout.PREFERRED_SIZE, javax.swing.GroupLayout.DEFAULT_SIZE, javax.swing.GroupLayout.PREFERRED_SIZE)))
+                                        .addComponent(max_down_speed_spinner, javax.swing.GroupLayout.PREFERRED_SIZE, javax.swing.GroupLayout.DEFAULT_SIZE, javax.swing.GroupLayout.PREFERRED_SIZE)))))))
                 .addContainerGap())
         );
         downloads_panelLayout.setVerticalGroup(
@@ -1299,6 +1575,8 @@ public class SettingsDialog extends javax.swing.JDialog {
                 .addComponent(rec_download_slots_label)
                 .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.UNRELATED)
                 .addComponent(clipboardspy_checkbox)
+                .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.RELATED)
+                .addComponent(always_reload_mega_folders_checkbox)
                 .addGap(10, 10, 10)
                 .addComponent(limit_download_speed_checkbox)
                 .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.RELATED)
@@ -1323,10 +1601,6 @@ public class SettingsDialog extends javax.swing.JDialog {
                     .addComponent(megacrypter_reverse_port_label))
                 .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.RELATED)
                 .addComponent(megacrypter_reverse_warning_label)
-                .addGap(18, 18, 18)
-                .addComponent(smart_proxy_checkbox)
-                .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.RELATED)
-                .addComponent(smart_proxy_settings, javax.swing.GroupLayout.PREFERRED_SIZE, javax.swing.GroupLayout.DEFAULT_SIZE, javax.swing.GroupLayout.PREFERRED_SIZE)
                 .addContainerGap())
         );
 
@@ -1601,6 +1875,24 @@ public class SettingsDialog extends javax.swing.JDialog {
             }
         });
 
+        export_mega_button.setFont(new java.awt.Font("Dialog", 1, 18)); // NOI18N
+        export_mega_button.setIcon(new javax.swing.ImageIcon(getClass().getResource("/images/icons8-import-30.png"))); // NOI18N
+        export_mega_button.setText("EXPORT ACCOUNTS (FILE)");
+        export_mega_button.addActionListener(new java.awt.event.ActionListener() {
+            public void actionPerformed(java.awt.event.ActionEvent evt) {
+                export_mega_buttonActionPerformed(evt);
+            }
+        });
+
+        export_elc_button.setFont(new java.awt.Font("Dialog", 1, 18)); // NOI18N
+        export_elc_button.setIcon(new javax.swing.ImageIcon(getClass().getResource("/images/icons8-import-30.png"))); // NOI18N
+        export_elc_button.setText("EXPORT ELC (FILE)");
+        export_elc_button.addActionListener(new java.awt.event.ActionListener() {
+            public void actionPerformed(java.awt.event.ActionEvent evt) {
+                export_elc_buttonActionPerformed(evt);
+            }
+        });
+
         javax.swing.GroupLayout accounts_panelLayout = new javax.swing.GroupLayout(accounts_panel);
         accounts_panel.setLayout(accounts_panelLayout);
         accounts_panelLayout.setHorizontalGroup(
@@ -1618,6 +1910,8 @@ public class SettingsDialog extends javax.swing.JDialog {
                     .addGroup(accounts_panelLayout.createSequentialGroup()
                         .addComponent(remove_mega_account_button)
                         .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.RELATED, javax.swing.GroupLayout.DEFAULT_SIZE, Short.MAX_VALUE)
+                        .addComponent(export_mega_button)
+                        .addGap(18, 18, 18)
                         .addComponent(import_mega_button)
                         .addGap(18, 18, 18)
                         .addComponent(add_mega_account_button))
@@ -1625,6 +1919,8 @@ public class SettingsDialog extends javax.swing.JDialog {
                     .addGroup(accounts_panelLayout.createSequentialGroup()
                         .addComponent(remove_elc_account_button)
                         .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.RELATED, javax.swing.GroupLayout.DEFAULT_SIZE, Short.MAX_VALUE)
+                        .addComponent(export_elc_button)
+                        .addGap(18, 18, 18)
                         .addComponent(add_elc_account_button))
                     .addGroup(accounts_panelLayout.createSequentialGroup()
                         .addGroup(accounts_panelLayout.createParallelGroup(javax.swing.GroupLayout.Alignment.LEADING)
@@ -1652,7 +1948,8 @@ public class SettingsDialog extends javax.swing.JDialog {
                 .addGroup(accounts_panelLayout.createParallelGroup(javax.swing.GroupLayout.Alignment.BASELINE)
                     .addComponent(remove_mega_account_button)
                     .addComponent(add_mega_account_button)
-                    .addComponent(import_mega_button))
+                    .addComponent(import_mega_button)
+                    .addComponent(export_mega_button))
                 .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.RELATED)
                 .addComponent(elc_accounts_label)
                 .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.RELATED)
@@ -1660,7 +1957,8 @@ public class SettingsDialog extends javax.swing.JDialog {
                 .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.RELATED)
                 .addGroup(accounts_panelLayout.createParallelGroup(javax.swing.GroupLayout.Alignment.BASELINE)
                     .addComponent(remove_elc_account_button)
-                    .addComponent(add_elc_account_button))
+                    .addComponent(add_elc_account_button)
+                    .addComponent(export_elc_button))
                 .addContainerGap())
         );
 
@@ -1841,8 +2139,50 @@ public class SettingsDialog extends javax.swing.JDialog {
             }
         });
 
+        run_command_dl_finish_checkbox.setFont(new java.awt.Font("Dialog", 1, 18)); // NOI18N
+        run_command_dl_finish_checkbox.setText("Execute this command when ALL downloads finish:");
+        run_command_dl_finish_checkbox.setDoubleBuffered(true);
+        run_command_dl_finish_checkbox.addActionListener(new java.awt.event.ActionListener() {
+            public void actionPerformed(java.awt.event.ActionEvent evt) {
+                run_command_dl_finish_checkboxActionPerformed(evt);
+            }
+        });
+
+        run_command_dl_finish_textbox.setFont(new java.awt.Font("Dialog", 0, 18)); // NOI18N
+        run_command_dl_finish_textbox.setDoubleBuffered(true);
+        run_command_dl_finish_textbox.setEnabled(false);
+
+        run_command_dl_finish_test_button.setFont(new java.awt.Font("Dialog", 1, 18)); // NOI18N
+        run_command_dl_finish_test_button.setText("Test");
+        run_command_dl_finish_test_button.addActionListener(new java.awt.event.ActionListener() {
+            public void actionPerformed(java.awt.event.ActionEvent evt) {
+                run_command_dl_finish_test_buttonActionPerformed(evt);
+            }
+        });
+
+        run_command_ul_finish_checkbox.setFont(new java.awt.Font("Dialog", 1, 18)); // NOI18N
+        run_command_ul_finish_checkbox.setText("Execute this command when ALL uploads finish:");
+        run_command_ul_finish_checkbox.setDoubleBuffered(true);
+        run_command_ul_finish_checkbox.addActionListener(new java.awt.event.ActionListener() {
+            public void actionPerformed(java.awt.event.ActionEvent evt) {
+                run_command_ul_finish_checkboxActionPerformed(evt);
+            }
+        });
+
+        run_command_ul_finish_textbox.setFont(new java.awt.Font("Dialog", 0, 18)); // NOI18N
+        run_command_ul_finish_textbox.setDoubleBuffered(true);
+        run_command_ul_finish_textbox.setEnabled(false);
+
+        run_command_ul_finish_test_button.setFont(new java.awt.Font("Dialog", 1, 18)); // NOI18N
+        run_command_ul_finish_test_button.setText("Test");
+        run_command_ul_finish_test_button.addActionListener(new java.awt.event.ActionListener() {
+            public void actionPerformed(java.awt.event.ActionEvent evt) {
+                run_command_ul_finish_test_buttonActionPerformed(evt);
+            }
+        });
+
         debug_file_checkbox.setFont(new java.awt.Font("Dialog", 1, 18)); // NOI18N
-        debug_file_checkbox.setText("Save debug info to file -> ");
+        debug_file_checkbox.setText("Save debug info to file ->");
 
         jButton1.setFont(new java.awt.Font("Dialog", 1, 18)); // NOI18N
         jButton1.setForeground(new java.awt.Color(255, 0, 0));
@@ -1920,6 +2260,29 @@ public class SettingsDialog extends javax.swing.JDialog {
         dark_mode_checkbox.setFont(new java.awt.Font("Dialog", 1, 18)); // NOI18N
         dark_mode_checkbox.setText("DARK MODE");
 
+        ext_lang_label.setFont(new java.awt.Font("Dialog", 1, 18)); // NOI18N
+        ext_lang_label.setText("External translation file:");
+
+        ext_lang_path_field.setFont(new java.awt.Font("Dialog", 0, 18)); // NOI18N
+        ext_lang_path_field.setEditable(false);
+        ext_lang_path_field.setToolTipText("UTF-8 .properties file whose entries override the embedded translation. Restart required.");
+
+        ext_lang_browse_button.setFont(new java.awt.Font("Dialog", 1, 18)); // NOI18N
+        ext_lang_browse_button.setText("Browse...");
+        ext_lang_browse_button.addActionListener(new java.awt.event.ActionListener() {
+            public void actionPerformed(java.awt.event.ActionEvent evt) {
+                ext_lang_browse_buttonActionPerformed(evt);
+            }
+        });
+
+        ext_lang_clear_button.setFont(new java.awt.Font("Dialog", 1, 18)); // NOI18N
+        ext_lang_clear_button.setText("Clear");
+        ext_lang_clear_button.addActionListener(new java.awt.event.ActionListener() {
+            public void actionPerformed(java.awt.event.ActionEvent evt) {
+                ext_lang_clear_buttonActionPerformed(evt);
+            }
+        });
+
         javax.swing.GroupLayout jPanel2Layout = new javax.swing.GroupLayout(jPanel2);
         jPanel2.setLayout(jPanel2Layout);
         jPanel2Layout.setHorizontalGroup(
@@ -1939,7 +2302,15 @@ public class SettingsDialog extends javax.swing.JDialog {
                         .addGroup(jPanel2Layout.createSequentialGroup()
                             .addComponent(jLabel2)
                             .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.RELATED, javax.swing.GroupLayout.DEFAULT_SIZE, Short.MAX_VALUE)
-                            .addComponent(language_combo, javax.swing.GroupLayout.PREFERRED_SIZE, 351, javax.swing.GroupLayout.PREFERRED_SIZE)))
+                            .addComponent(language_combo, javax.swing.GroupLayout.PREFERRED_SIZE, 351, javax.swing.GroupLayout.PREFERRED_SIZE))
+                        .addGroup(jPanel2Layout.createSequentialGroup()
+                            .addComponent(ext_lang_label)
+                            .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.RELATED)
+                            .addComponent(ext_lang_path_field, javax.swing.GroupLayout.DEFAULT_SIZE, 200, Short.MAX_VALUE)
+                            .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.RELATED)
+                            .addComponent(ext_lang_browse_button)
+                            .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.RELATED)
+                            .addComponent(ext_lang_clear_button)))
                     .addComponent(dark_mode_checkbox))
                 .addContainerGap())
         );
@@ -1958,6 +2329,12 @@ public class SettingsDialog extends javax.swing.JDialog {
                 .addGroup(jPanel2Layout.createParallelGroup(javax.swing.GroupLayout.Alignment.BASELINE)
                     .addComponent(jLabel2)
                     .addComponent(language_combo, javax.swing.GroupLayout.PREFERRED_SIZE, javax.swing.GroupLayout.DEFAULT_SIZE, javax.swing.GroupLayout.PREFERRED_SIZE))
+                .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.RELATED)
+                .addGroup(jPanel2Layout.createParallelGroup(javax.swing.GroupLayout.Alignment.BASELINE)
+                    .addComponent(ext_lang_label)
+                    .addComponent(ext_lang_path_field, javax.swing.GroupLayout.PREFERRED_SIZE, javax.swing.GroupLayout.DEFAULT_SIZE, javax.swing.GroupLayout.PREFERRED_SIZE)
+                    .addComponent(ext_lang_browse_button)
+                    .addComponent(ext_lang_clear_button))
                 .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.RELATED)
                 .addComponent(dark_mode_checkbox)
                 .addContainerGap())
@@ -1988,6 +2365,16 @@ public class SettingsDialog extends javax.swing.JDialog {
                         .addComponent(custom_chunks_dir_current_label))
                     .addComponent(rec_zoom_label)
                     .addComponent(run_command_checkbox)
+                    .addComponent(run_command_dl_finish_checkbox)
+                    .addGroup(advanced_panelLayout.createSequentialGroup()
+                        .addComponent(run_command_dl_finish_test_button)
+                        .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.RELATED)
+                        .addComponent(run_command_dl_finish_textbox))
+                    .addComponent(run_command_ul_finish_checkbox)
+                    .addGroup(advanced_panelLayout.createSequentialGroup()
+                        .addComponent(run_command_ul_finish_test_button)
+                        .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.RELATED)
+                        .addComponent(run_command_ul_finish_textbox))
                     .addGroup(advanced_panelLayout.createSequentialGroup()
                         .addComponent(custom_chunks_dir_checkbox)
                         .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.RELATED)
@@ -2022,6 +2409,18 @@ public class SettingsDialog extends javax.swing.JDialog {
                 .addGroup(advanced_panelLayout.createParallelGroup(javax.swing.GroupLayout.Alignment.BASELINE)
                     .addComponent(run_command_textbox, javax.swing.GroupLayout.PREFERRED_SIZE, javax.swing.GroupLayout.DEFAULT_SIZE, javax.swing.GroupLayout.PREFERRED_SIZE)
                     .addComponent(run_command_test_button))
+                .addGap(18, 18, 18)
+                .addComponent(run_command_dl_finish_checkbox)
+                .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.RELATED)
+                .addGroup(advanced_panelLayout.createParallelGroup(javax.swing.GroupLayout.Alignment.BASELINE)
+                    .addComponent(run_command_dl_finish_textbox, javax.swing.GroupLayout.PREFERRED_SIZE, javax.swing.GroupLayout.DEFAULT_SIZE, javax.swing.GroupLayout.PREFERRED_SIZE)
+                    .addComponent(run_command_dl_finish_test_button))
+                .addGap(18, 18, 18)
+                .addComponent(run_command_ul_finish_checkbox)
+                .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.RELATED)
+                .addGroup(advanced_panelLayout.createParallelGroup(javax.swing.GroupLayout.Alignment.BASELINE)
+                    .addComponent(run_command_ul_finish_textbox, javax.swing.GroupLayout.PREFERRED_SIZE, javax.swing.GroupLayout.DEFAULT_SIZE, javax.swing.GroupLayout.PREFERRED_SIZE)
+                    .addComponent(run_command_ul_finish_test_button))
                 .addGap(18, 18, 18)
                 .addComponent(proxy_panel, javax.swing.GroupLayout.PREFERRED_SIZE, javax.swing.GroupLayout.DEFAULT_SIZE, javax.swing.GroupLayout.PREFERRED_SIZE)
                 .addGap(18, 18, 18)
@@ -2218,7 +2617,13 @@ public class SettingsDialog extends javax.swing.JDialog {
             settings.put("custom_chunks_dir", _custom_chunks_dir);
             settings.put("run_command", run_command_checkbox.isSelected() ? "yes" : "no");
             settings.put("run_command_path", run_command_textbox.getText());
+            // #774 -- persist the two new independent post-finish commands.
+            settings.put("run_command_dl_finish", run_command_dl_finish_checkbox.isSelected() ? "yes" : "no");
+            settings.put("run_command_dl_finish_path", run_command_dl_finish_textbox.getText());
+            settings.put("run_command_ul_finish", run_command_ul_finish_checkbox.isSelected() ? "yes" : "no");
+            settings.put("run_command_ul_finish_path", run_command_ul_finish_textbox.getText());
             settings.put("clipboardspy", clipboardspy_checkbox.isSelected() ? "yes" : "no");
+            settings.put("always_reload_mega_folders", always_reload_mega_folders_checkbox.isSelected() ? "yes" : "no");
             settings.put("thumbnails", thumbnail_checkbox.isSelected() ? "yes" : "no");
             settings.put("upload_log", upload_log_checkbox.isSelected() ? "yes" : "no");
             settings.put("force_smart_proxy", force_smart_proxy_checkbox.isSelected() ? "yes" : "no");
@@ -2358,27 +2763,41 @@ public class SettingsDialog extends javax.swing.JDialog {
 
             String proxy_pass = new String(proxy_pass_textfield.getPassword());
 
-            String old_debug_file = DBTools.selectSettingValue("debug_file");
+            // External translation file override (#766). Trim and treat empty
+            // the same as "no override". Persisted as-is; MainPanel re-reads
+            // on startup and calls I18n.setExternalLanguageFile().
+            String old_external_language_file = DBTools.selectSettingValue("external_language_file");
 
-            if (old_debug_file == null) {
-
-                old_debug_file = "no";
+            if (old_external_language_file == null) {
+                old_external_language_file = "";
             }
 
-            String debug_file = debug_file_checkbox.isSelected() ? "yes" : "no";
+            String external_language_file = ext_lang_path_field.getText() != null ? ext_lang_path_field.getText().trim() : "";
 
-            settings.put("debug_file", debug_file);
+            // "debug_file" setting retired (replaced by DEBUG LOG tab); don't
+            // persist a value any more and don't include it in the
+            // restart-required check.
+
             settings.put("use_proxy", use_proxy ? "yes" : "no");
             settings.put("proxy_host", proxy_host);
             settings.put("proxy_port", proxy_port);
             settings.put("proxy_user", proxy_user);
             settings.put("proxy_pass", proxy_pass);
             settings.put("font_zoom", zoom);
+            settings.put("external_language_file", external_language_file);
 
             insertSettingsValues(settings);
 
-            if (!debug_file.equals(old_debug_file)
-                    || !font.equals(old_font)
+            // Quota recovery tab owns its own DB-backed keys
+            // (auto_resume_ip_change, quota_stall_timeout,
+            // smart_proxy_509_recheck_window, smartproxy_test_batch_size) and
+            // also pokes the live SmartProxy manager to re-read its settings
+            // so the recheck window takes effect without restart. (#757)
+            if (_quota_recovery_panel != null) {
+                _quota_recovery_panel.saveToDB();
+            }
+
+            if (!font.equals(old_font)
                     || !language.equals(old_language)
                     || !zoom.equals(old_zoom)
                     || use_proxy != old_use_proxy
@@ -2386,7 +2805,8 @@ public class SettingsDialog extends javax.swing.JDialog {
                     || !proxy_port.equals(old_proxy_port)
                     || !proxy_user.equals(old_proxy_user)
                     || !proxy_pass.equals(old_proxy_pass)
-                    || dark_mode != old_dark_mode) {
+                    || dark_mode != old_dark_mode
+                    || !external_language_file.equals(old_external_language_file)) {
 
                 _main_panel.setRestart(true);
             }
@@ -2417,53 +2837,22 @@ public class SettingsDialog extends javax.swing.JDialog {
 
                     if (!host_table.isEmpty() && !user_table.isEmpty() && !apikey_table.isEmpty()) {
 
-                        if (_main_panel.getElc_accounts().get(host_table) == null) {
+                        // Compare against existing plaintext credentials (if any) and
+                        // persist only when the row is new or has actually changed.
+                        // AccountStore handles the encrypt-at-rest step so this loop
+                        // doesn't have to know about master_pass.
+                        String[] existing = null;
+                        try {
+                            existing = _account_store.getElcCredentials(host_table);
+                        } catch (Exception ex) {
+                            LOG.log(Level.SEVERE, "Reading ELC credentials for {0}: {1}", new Object[]{host_table, ex.getMessage()});
+                        }
 
-                            if (_main_panel.getMaster_pass_hash() != null) {
-
-                                user_table = Bin2BASE64(CryptTools.aes_cbc_encrypt_at_rest(user_table.getBytes("UTF-8"), _main_panel.getMaster_pass()));
-
-                                apikey_table = Bin2BASE64(CryptTools.aes_cbc_encrypt_at_rest(apikey_table.getBytes("UTF-8"), _main_panel.getMaster_pass()));
-                            }
-
-                            DBTools.insertELCAccount(host_table, user_table, apikey_table);
-
-                        } else {
-
-                            HashMap<String, Object> elc_account_data = (HashMap) _main_panel.getElc_accounts().get(host_table);
-
-                            String user = (String) elc_account_data.get("user");
-
-                            String apikey = (String) elc_account_data.get("apikey");
-
-                            if (_main_panel.getMaster_pass() != null) {
-
-                                try {
-
-                                    user = new String(CryptTools.aes_cbc_decrypt_at_rest(BASE642Bin(user), _main_panel.getMaster_pass()), "UTF-8");
-
-                                    apikey = new String(CryptTools.aes_cbc_decrypt_at_rest(BASE642Bin(apikey), _main_panel.getMaster_pass()), "UTF-8");
-
-                                } catch (Exception ex) {
-                                    LOG.log(Level.SEVERE, ex.getMessage());
-                                }
-                            }
-
-                            if (!user.equals(user_table) || !apikey.equals(apikey_table)) {
-
-                                user = user_table;
-
-                                apikey = apikey_table;
-
-                                if (_main_panel.getMaster_pass() != null) {
-
-                                    user = Bin2BASE64(CryptTools.aes_cbc_encrypt_at_rest(user_table.getBytes("UTF-8"), _main_panel.getMaster_pass()));
-
-                                    apikey = Bin2BASE64(CryptTools.aes_cbc_encrypt_at_rest(apikey_table.getBytes("UTF-8"), _main_panel.getMaster_pass()));
-
-                                }
-
-                                DBTools.insertELCAccount(host_table, user, apikey);
+                        if (existing == null || !existing[0].equals(user_table) || !existing[1].equals(apikey_table)) {
+                            try {
+                                _account_store.persistElcAccount(host_table, user_table, apikey_table);
+                            } catch (Exception ex) {
+                                LOG.log(Level.SEVERE, "Persisting ELC account {0}: {1}", new Object[]{host_table, ex.getMessage()});
                             }
                         }
                     }
@@ -2515,7 +2904,7 @@ public class SettingsDialog extends javax.swing.JDialog {
 
                         MiscTools.GUIRun(() -> {
 
-                            status.setText(LabelTranslatorSingleton.getInstance().translate("Checking your MEGA accounts, please wait... ") + email + " (" + String.valueOf(j + 1) + "/" + String.valueOf(model_row_count) + ")");
+                            status.setText(I18n.tr("ui.dynamic.checking_account_progress", email, j + 1, model_row_count));
 
                         });
 
@@ -2523,183 +2912,24 @@ public class SettingsDialog extends javax.swing.JDialog {
 
                             new_valid_mega_accounts.add(email);
 
-                            MegaAPI ma;
-
-                            if (_main_panel.getMega_accounts().get(email) == null) {
-
-                                ma = new MegaAPI();
-
-                                try {
-
-                                    String pincode = null;
-
-                                    boolean error_2FA = false;
-
-                                    if (!_main_panel.getMega_active_accounts().containsKey(email) && ma.check2FA(email)) {
-
-                                        final String[] code_holder = {null};
-                                        final boolean[] cancelled = {false};
-                                        final String f_email = email;
-                                        MiscTools.GUIRunAndWait(() -> {
-                                            Get2FACode dialog = new Get2FACode((Frame) getParent(), true, f_email, _main_panel);
-                                            dialog.setLocationRelativeTo(tthis);
-                                            dialog.setVisible(true);
-                                            if (dialog.isCode_ok()) {
-                                                code_holder[0] = dialog.getPin_code();
-                                            } else {
-                                                cancelled[0] = true;
-                                            }
-                                        });
-
-                                        if (cancelled[0]) {
-                                            error_2FA = true;
-                                        } else {
-                                            pincode = code_holder[0];
-                                        }
-                                    }
-
-                                    if (!error_2FA) {
-                                        if (!_main_panel.getMega_active_accounts().containsKey(email)) {
-                                            ma.login(email, pass, pincode);
-
-                                            ByteArrayOutputStream bs = new ByteArrayOutputStream();
-
-                                            try (ObjectOutputStream os = new ObjectOutputStream(bs)) {
-                                                os.writeObject(ma);
-                                            }
-
-                                            if (_main_panel.getMaster_pass() != null) {
-
-                                                DBTools.insertMegaSession(email, CryptTools.aes_cbc_encrypt_at_rest(bs.toByteArray(), _main_panel.getMaster_pass()), true);
-
-                                            } else {
-
-                                                DBTools.insertMegaSession(email, bs.toByteArray(), false);
-                                            }
-
-                                            _main_panel.getMega_active_accounts().put(email, ma);
-
-                                            String password = pass, password_aes = Bin2BASE64(i32a2bin(ma.getPassword_aes())), user_hash = ma.getUser_hash();
-
-                                            if (_main_panel.getMaster_pass_hash() != null) {
-
-                                                password = Bin2BASE64(CryptTools.aes_cbc_encrypt_at_rest(pass.getBytes("UTF-8"), _main_panel.getMaster_pass()));
-
-                                                password_aes = Bin2BASE64(CryptTools.aes_cbc_encrypt_at_rest(i32a2bin(ma.getPassword_aes()), _main_panel.getMaster_pass()));
-
-                                                user_hash = Bin2BASE64(CryptTools.aes_cbc_encrypt_at_rest(UrlBASE642Bin(ma.getUser_hash()), _main_panel.getMaster_pass()));
-                                            }
-
-                                            DBTools.insertMegaAccount(email, password, password_aes, user_hash);
-                                        }
-
-                                    } else {
-                                        email_error.add(email);
-                                    }
-
-                                } catch (Exception ex) {
-
-                                    email_error.add(email);
-                                    LOG.log(Level.SEVERE, ex.getMessage());
-                                }
-
+                            // Decide if this row needs (re-)login: new
+                            // account, or existing account whose stored
+                            // password differs from the user-entered one.
+                            boolean needs_login;
+                            if (!_main_panel.getMega_accounts().containsKey(email)) {
+                                needs_login = true;
                             } else {
-
-                                HashMap<String, Object> mega_account_data = (HashMap) _main_panel.getMega_accounts().get(email);
-
-                                String password = (String) mega_account_data.get("password");
-
-                                if (_main_panel.getMaster_pass() != null) {
-
-                                    try {
-
-                                        password = new String(CryptTools.aes_cbc_decrypt_at_rest(BASE642Bin(password), _main_panel.getMaster_pass()), "UTF-8");
-
-                                    } catch (Exception ex) {
-                                        LOG.log(Level.SEVERE, ex.getMessage());
-                                    }
+                                try {
+                                    String stored = _account_store.getMegaPassword(email);
+                                    needs_login = stored == null || !stored.equals(pass);
+                                } catch (Exception ex) {
+                                    LOG.log(Level.SEVERE, "Reading stored password for {0}: {1}", new Object[]{email, ex.getMessage()});
+                                    needs_login = true;
                                 }
+                            }
 
-                                if (!password.equals(pass)) {
-
-                                    ma = new MegaAPI();
-
-                                    try {
-
-                                        String pincode = null;
-
-                                        boolean error_2FA = false;
-
-                                        if (!_main_panel.getMega_active_accounts().containsKey(email) && ma.check2FA(email)) {
-
-                                            final String[] code_holder = {null};
-                                            final boolean[] cancelled = {false};
-                                            final String f_email = email;
-                                            MiscTools.GUIRunAndWait(() -> {
-                                                Get2FACode dialog = new Get2FACode((Frame) getParent(), true, f_email, _main_panel);
-                                                dialog.setLocationRelativeTo(tthis);
-                                                dialog.setVisible(true);
-                                                if (dialog.isCode_ok()) {
-                                                    code_holder[0] = dialog.getPin_code();
-                                                } else {
-                                                    cancelled[0] = true;
-                                                }
-                                            });
-
-                                            if (cancelled[0]) {
-                                                error_2FA = true;
-                                            } else {
-                                                pincode = code_holder[0];
-                                            }
-                                        }
-
-                                        if (!error_2FA) {
-                                            if (!_main_panel.getMega_active_accounts().containsKey(email)) {
-                                                ma.login(email, pass, pincode);
-
-                                                ByteArrayOutputStream bs = new ByteArrayOutputStream();
-
-                                                try (ObjectOutputStream os = new ObjectOutputStream(bs)) {
-                                                    os.writeObject(ma);
-                                                }
-
-                                                if (_main_panel.getMaster_pass() != null) {
-
-                                                    DBTools.insertMegaSession(email, CryptTools.aes_cbc_encrypt_at_rest(bs.toByteArray(), _main_panel.getMaster_pass()), true);
-
-                                                } else {
-
-                                                    DBTools.insertMegaSession(email, bs.toByteArray(), false);
-                                                }
-
-                                                _main_panel.getMega_active_accounts().put(email, ma);
-
-                                                password = pass;
-
-                                                String password_aes = Bin2BASE64(i32a2bin(ma.getPassword_aes())), user_hash = ma.getUser_hash();
-
-                                                if (_main_panel.getMaster_pass() != null) {
-
-                                                    password = Bin2BASE64(CryptTools.aes_cbc_encrypt_at_rest(pass.getBytes("UTF-8"), _main_panel.getMaster_pass()));
-
-                                                    password_aes = Bin2BASE64(CryptTools.aes_cbc_encrypt_at_rest(i32a2bin(ma.getPassword_aes()), _main_panel.getMaster_pass()));
-
-                                                    user_hash = Bin2BASE64(CryptTools.aes_cbc_encrypt_at_rest(UrlBASE642Bin(ma.getUser_hash()), _main_panel.getMaster_pass()));
-                                                }
-
-                                                DBTools.insertMegaAccount(email, password, password_aes, user_hash);
-                                            }
-                                        } else {
-                                            email_error.add(email);
-                                        }
-
-                                    } catch (Exception ex) {
-
-                                        email_error.add(email);
-                                        LOG.log(Level.SEVERE, ex.getMessage());
-
-                                    }
-                                }
+                            if (needs_login && !_loginAndPersistMegaAccount(email, pass, tthis)) {
+                                email_error.add(email);
                             }
                         }
                     }
@@ -2764,9 +2994,11 @@ public class SettingsDialog extends javax.swing.JDialog {
 
         } catch (SQLException ex) {
             LOG.log(Level.SEVERE, ex.getMessage());
-        } catch (NoSuchAlgorithmException | NoSuchPaddingException | InvalidKeyException | InvalidAlgorithmParameterException | IllegalBlockSizeException | BadPaddingException ex) {
-            LOG.log(Level.SEVERE, ex.getMessage());
         } catch (Exception ex) {
+            // The crypto multicatch (NoSuchAlgorithm, BadPadding, ...) that
+            // used to live here became unreachable after the ELC save loop
+            // moved to AccountStore (which surfaces those via Exception).
+            // Generic catch keeps coverage.
             LOG.log(Level.SEVERE, ex.getMessage());
         }
     }//GEN-LAST:event_save_buttonActionPerformed
@@ -2828,11 +3060,13 @@ public class SettingsDialog extends javax.swing.JDialog {
 
                 DefaultTableModel mega_model = new DefaultTableModel(new Object[][]{}, new String[]{"Email", "Password"});
 
-                DefaultTableModel elc_model = new DefaultTableModel(new Object[][]{}, new String[]{"Host", "User", "API KEY"});
+                DefaultTableModel elc_model = new DefaultTableModel(new Object[][]{}, new String[]{"Host", "User", "API-KEY"});
 
                 mega_accounts_table.setModel(mega_model);
 
                 elc_accounts_table.setModel(elc_model);
+
+                translateAccountTableHeaders();
 
                 encrypt_pass_checkbox.setEnabled(true);
 
@@ -2852,42 +3086,7 @@ public class SettingsDialog extends javax.swing.JDialog {
 
                 delete_all_accounts_button.setEnabled(true);
 
-                _main_panel.getMega_accounts().entrySet().stream().map((pair) -> {
-                    HashMap<String, Object> data = (HashMap) pair.getValue();
-                    String pass = null;
-                    try {
-
-                        pass = new String(CryptTools.aes_cbc_decrypt_at_rest(BASE642Bin((String) data.get("password")), _main_panel.getMaster_pass()), "UTF-8");
-
-                    } catch (NoSuchAlgorithmException | NoSuchPaddingException | InvalidKeyException | InvalidAlgorithmParameterException | IllegalBlockSizeException | BadPaddingException ex) {
-                        LOG.log(Level.SEVERE, ex.getMessage());
-                    } catch (Exception ex) {
-                        LOG.log(Level.SEVERE, ex.getMessage());
-                    }
-                    String[] new_row_data = {(String) pair.getKey(), pass};
-                    return new_row_data;
-                }).forEachOrdered((new_row_data) -> {
-                    mega_model.addRow(new_row_data);
-                });
-                _main_panel.getElc_accounts().entrySet().stream().map((pair) -> {
-                    HashMap<String, Object> data = (HashMap) pair.getValue();
-                    String user = null, apikey = null;
-                    try {
-
-                        user = new String(CryptTools.aes_cbc_decrypt_at_rest(BASE642Bin((String) data.get("user")), _main_panel.getMaster_pass()), "UTF-8");
-
-                        apikey = new String(CryptTools.aes_cbc_decrypt_at_rest(BASE642Bin((String) data.get("apikey")), _main_panel.getMaster_pass()), "UTF-8");
-
-                    } catch (NoSuchAlgorithmException | NoSuchPaddingException | InvalidKeyException | InvalidAlgorithmParameterException | IllegalBlockSizeException | BadPaddingException ex) {
-                        LOG.log(Level.SEVERE, ex.getMessage());
-                    } catch (Exception ex) {
-                        LOG.log(Level.SEVERE, ex.getMessage());
-                    }
-                    String[] new_row_data = {(String) pair.getKey(), user, apikey};
-                    return new_row_data;
-                }).forEachOrdered((new_row_data) -> {
-                    elc_model.addRow(new_row_data);
-                });
+                _populateAccountTablesFromStore(mega_model, elc_model);
 
                 mega_accounts_table.setAutoCreateRowSorter(true);
                 DefaultRowSorter sorter_mega = ((DefaultRowSorter) mega_accounts_table.getRowSorter());
@@ -2948,11 +3147,13 @@ public class SettingsDialog extends javax.swing.JDialog {
 
                 DefaultTableModel new_mega_model = new DefaultTableModel(new Object[][]{}, new String[]{"Email", "Password"});
 
-                DefaultTableModel new_elc_model = new DefaultTableModel(new Object[][]{}, new String[]{"Host", "User", "API KEY"});
+                DefaultTableModel new_elc_model = new DefaultTableModel(new Object[][]{}, new String[]{"Host", "User", "API-KEY"});
 
                 mega_accounts_table.setModel(new_mega_model);
 
                 elc_accounts_table.setModel(new_elc_model);
+
+                translateAccountTableHeaders();
 
                 DBTools.truncateMegaAccounts();
 
@@ -3031,84 +3232,7 @@ public class SettingsDialog extends javax.swing.JDialog {
 
                     insertSettingValue("master_pass_hash", _main_panel.getMaster_pass_hash());
 
-                    for (Map.Entry pair : _main_panel.getMega_accounts().entrySet()) {
-
-                        HashMap<String, Object> data = (HashMap) pair.getValue();
-
-                        String email, password, password_aes, user_hash;
-
-                        email = (String) pair.getKey();
-
-                        if (old_master_pass_hash != null) {
-
-                            password = new String(CryptTools.aes_cbc_decrypt_at_rest(BASE642Bin((String) data.get("password")), old_master_pass), "UTF-8");
-
-                            password_aes = Bin2BASE64(CryptTools.aes_cbc_decrypt_at_rest(BASE642Bin((String) data.get("password_aes")), old_master_pass));
-
-                            user_hash = Bin2BASE64(CryptTools.aes_cbc_decrypt_at_rest(BASE642Bin((String) data.get("user_hash")), old_master_pass));
-
-                        } else {
-
-                            password = (String) data.get("password");
-
-                            password_aes = (String) data.get("password_aes");
-
-                            user_hash = (String) data.get("user_hash");
-                        }
-
-                        if (_main_panel.getMaster_pass() != null) {
-
-                            password = Bin2BASE64(CryptTools.aes_cbc_encrypt_at_rest(password.getBytes("UTF-8"), _main_panel.getMaster_pass()));
-
-                            password_aes = Bin2BASE64(CryptTools.aes_cbc_encrypt_at_rest(BASE642Bin(password_aes), _main_panel.getMaster_pass()));
-
-                            user_hash = Bin2BASE64(CryptTools.aes_cbc_encrypt_at_rest(BASE642Bin(user_hash.replace('-', '+').replace('_', '/')), _main_panel.getMaster_pass()));
-                        }
-
-                        data.put("password", password);
-
-                        data.put("password_aes", password_aes);
-
-                        data.put("user_hash", user_hash);
-
-                        DBTools.insertMegaAccount(email, password, password_aes, user_hash);
-                    }
-
-                    for (Map.Entry pair : _main_panel.getElc_accounts().entrySet()) {
-
-                        HashMap<String, Object> data = (HashMap) pair.getValue();
-
-                        String host, user, apikey;
-
-                        host = (String) pair.getKey();
-
-                        if (old_master_pass_hash != null) {
-
-                            user = new String(CryptTools.aes_cbc_decrypt_at_rest(BASE642Bin((String) data.get("user")), old_master_pass), "UTF-8");
-
-                            apikey = new String(CryptTools.aes_cbc_decrypt_at_rest(BASE642Bin((String) data.get("apikey")), old_master_pass), "UTF-8");
-
-                        } else {
-
-                            user = (String) data.get("user");
-
-                            apikey = (String) data.get("apikey");
-
-                        }
-
-                        if (_main_panel.getMaster_pass() != null) {
-
-                            user = Bin2BASE64(CryptTools.aes_cbc_encrypt_at_rest(user.getBytes("UTF-8"), _main_panel.getMaster_pass()));
-
-                            apikey = Bin2BASE64(CryptTools.aes_cbc_encrypt_at_rest(apikey.getBytes("UTF-8"), _main_panel.getMaster_pass()));
-                        }
-
-                        data.put("user", user);
-
-                        data.put("apikey", apikey);
-
-                        DBTools.insertELCAccount(host, user, apikey);
-                    }
+                    _account_store.migrateMasterPass(old_master_pass, old_master_pass_hash);
 
                 } catch (Exception ex) {
                     LOG.log(Level.SEVERE, ex.getMessage());
@@ -3132,6 +3256,25 @@ public class SettingsDialog extends javax.swing.JDialog {
 
         mega_accounts_table.clearSelection();
     }//GEN-LAST:event_add_mega_account_buttonActionPerformed
+
+    // Re-emits the ELC account-table column headers through the i18n bundle.
+    // JTable header values are not visited by translateLabels (which only
+    // walks JLabel / AbstractButton subtypes), so the headers baked in by
+    // .form-generated initComponents (and any later setModel) would
+    // otherwise stay in raw English. MEGA columns (Email / Password) are
+    // skipped because both terms are used verbatim across every bundle
+    // -- and the existing password key carries a trailing colon used by
+    // a different label, so translating "Password" through it would no-op.
+    // Called once from the constructor and from every setModel call that
+    // rebuilds the ELC model (#770).
+    private void translateAccountTableHeaders() {
+        if (elc_accounts_table.getColumnModel().getColumnCount() >= 3) {
+            elc_accounts_table.getColumnModel().getColumn(0).setHeaderValue(LabelTranslatorSingleton.getInstance().translate("Host"));
+            elc_accounts_table.getColumnModel().getColumn(1).setHeaderValue(LabelTranslatorSingleton.getInstance().translate("User"));
+            elc_accounts_table.getColumnModel().getColumn(2).setHeaderValue(LabelTranslatorSingleton.getInstance().translate("API-KEY"));
+            elc_accounts_table.getTableHeader().repaint();
+        }
+    }
 
     private void remove_mega_account_buttonActionPerformed(java.awt.event.ActionEvent evt) {//GEN-FIRST:event_remove_mega_account_buttonActionPerformed
 
@@ -3182,16 +3325,106 @@ public class SettingsDialog extends javax.swing.JDialog {
                 new ProcessBuilder(argv).inheritIO().start();
             } catch (IOException ex) {
                 Logger.getLogger(MiscTools.class.getName()).log(Level.SEVERE, ex.getMessage());
-                JOptionPane.showMessageDialog(this, ex.getMessage(), "Error", JOptionPane.ERROR_MESSAGE);
+                JOptionPane.showMessageDialog(this, ex.getMessage(), I18n.tr("ui.error_title"), JOptionPane.ERROR_MESSAGE);
             }
         }
     }//GEN-LAST:event_run_command_test_buttonActionPerformed
+
+    private void ext_lang_browse_buttonActionPerformed(java.awt.event.ActionEvent evt) {//GEN-FIRST:event_ext_lang_browse_buttonActionPerformed
+
+        // Pick a UTF-8 .properties file to override the embedded translation
+        // bundle (#766). Applied on restart, same as language switch.
+        javax.swing.JFileChooser filechooser = new javax.swing.JFileChooser();
+
+        updateFonts(filechooser, GUI_FONT, (float) (_main_panel.getZoom_factor() * 1.25));
+
+        filechooser.setDialogTitle(LabelTranslatorSingleton.getInstance().translate("Select translation file"));
+        filechooser.setFileSelectionMode(JFileChooser.FILES_ONLY);
+        filechooser.addChoosableFileFilter(new FileNameExtensionFilter(LabelTranslatorSingleton.getInstance().translate("Java properties (UTF-8) (*.properties)"), "properties"));
+        filechooser.setAcceptAllFileFilterUsed(false);
+
+        // Translators typically drop messages_xx.properties next to the
+        // MegaBasterd jar, so default the dialog there when no path is
+        // already set -- saves several scroll/click steps versus the JVM
+        // default (user home). Falls back to the JFileChooser default if
+        // the jar location cannot be resolved (e.g. running from an
+        // unpacked classpath). Larger preferred size cuts the amount of
+        // scrolling in deep directory trees (#770).
+        filechooser.setPreferredSize(new java.awt.Dimension(900, 600));
+
+        String current = ext_lang_path_field.getText();
+        if (current != null && !current.trim().isEmpty()) {
+            File f = new File(current.trim());
+            if (f.exists()) {
+                filechooser.setSelectedFile(f);
+            } else if (f.getParentFile() != null && f.getParentFile().exists()) {
+                filechooser.setCurrentDirectory(f.getParentFile());
+            }
+        } else {
+            String jar_dir = MiscTools.getCurrentJarParentPath();
+            if (jar_dir != null) {
+                File jar_dir_file = new File(jar_dir);
+                if (jar_dir_file.exists() && jar_dir_file.isDirectory()) {
+                    filechooser.setCurrentDirectory(jar_dir_file);
+                }
+            }
+        }
+
+        if (filechooser.showOpenDialog(this) == JFileChooser.APPROVE_OPTION) {
+            ext_lang_path_field.setText(filechooser.getSelectedFile().getAbsolutePath());
+        }
+    }//GEN-LAST:event_ext_lang_browse_buttonActionPerformed
+
+    private void ext_lang_clear_buttonActionPerformed(java.awt.event.ActionEvent evt) {//GEN-FIRST:event_ext_lang_clear_buttonActionPerformed
+
+        ext_lang_path_field.setText("");
+    }//GEN-LAST:event_ext_lang_clear_buttonActionPerformed
 
     private void run_command_checkboxActionPerformed(java.awt.event.ActionEvent evt) {//GEN-FIRST:event_run_command_checkboxActionPerformed
         // TODO add your handling code here:
 
         run_command_textbox.setEnabled(run_command_checkbox.isSelected());
     }//GEN-LAST:event_run_command_checkboxActionPerformed
+
+    private void run_command_dl_finish_checkboxActionPerformed(java.awt.event.ActionEvent evt) {//GEN-FIRST:event_run_command_dl_finish_checkboxActionPerformed
+        run_command_dl_finish_textbox.setEnabled(run_command_dl_finish_checkbox.isSelected());
+    }//GEN-LAST:event_run_command_dl_finish_checkboxActionPerformed
+
+    private void run_command_ul_finish_checkboxActionPerformed(java.awt.event.ActionEvent evt) {//GEN-FIRST:event_run_command_ul_finish_checkboxActionPerformed
+        run_command_ul_finish_textbox.setEnabled(run_command_ul_finish_checkbox.isSelected());
+    }//GEN-LAST:event_run_command_ul_finish_checkboxActionPerformed
+
+    /**
+     * #774 -- shared spawn helper for the Test buttons of the post-finish
+     * commands. Mirrors run_command_test_buttonActionPerformed above but
+     * takes the textbox as parameter so we don't duplicate the body twice.
+     */
+    private void _runTestCommand(javax.swing.JTextField source) {
+        if (source.getText() != null && !"".equals(source.getText().trim())) {
+            try {
+                String cmd = source.getText().trim();
+                java.io.File f = new java.io.File(cmd);
+                java.util.List<String> argv;
+                if (f.exists()) {
+                    argv = java.util.Collections.singletonList(cmd);
+                } else {
+                    argv = java.util.Arrays.asList(cmd.split("\\s+"));
+                }
+                new ProcessBuilder(argv).inheritIO().start();
+            } catch (IOException ex) {
+                Logger.getLogger(SettingsDialog.class.getName()).log(Level.SEVERE, ex.getMessage());
+                JOptionPane.showMessageDialog(this, ex.getMessage(), I18n.tr("ui.error_title"), JOptionPane.ERROR_MESSAGE);
+            }
+        }
+    }
+
+    private void run_command_dl_finish_test_buttonActionPerformed(java.awt.event.ActionEvent evt) {//GEN-FIRST:event_run_command_dl_finish_test_buttonActionPerformed
+        _runTestCommand(run_command_dl_finish_textbox);
+    }//GEN-LAST:event_run_command_dl_finish_test_buttonActionPerformed
+
+    private void run_command_ul_finish_test_buttonActionPerformed(java.awt.event.ActionEvent evt) {//GEN-FIRST:event_run_command_ul_finish_test_buttonActionPerformed
+        _runTestCommand(run_command_ul_finish_textbox);
+    }//GEN-LAST:event_run_command_ul_finish_test_buttonActionPerformed
 
     private void custom_chunks_dir_checkboxActionPerformed(java.awt.event.ActionEvent evt) {//GEN-FIRST:event_custom_chunks_dir_checkboxActionPerformed
 
@@ -3213,7 +3446,7 @@ public class SettingsDialog extends javax.swing.JDialog {
         updateFonts(filechooser, GUI_FONT, (float) (_main_panel.getZoom_factor() * 1.25));
 
         filechooser.setCurrentDirectory(new java.io.File(_download_path));
-        filechooser.setDialogTitle("Temporary chunks directory");
+        filechooser.setDialogTitle(I18n.tr("ui.filechooser.temp_chunks_dir"));
         filechooser.setFileSelectionMode(javax.swing.JFileChooser.DIRECTORIES_ONLY);
         filechooser.setAcceptAllFileFilterUsed(false);
 
@@ -3264,7 +3497,7 @@ public class SettingsDialog extends javax.swing.JDialog {
             JFileChooser filechooser = new JFileChooser();
             updateFonts(filechooser, GUI_FONT, (float) (_main_panel.getZoom_factor() * 1.25));
             filechooser.setCurrentDirectory(new File(_download_path));
-            filechooser.setDialogTitle("Save as");
+            filechooser.setDialogTitle(I18n.tr("ui.filechooser.save_as"));
 
             if (filechooser.showSaveDialog(this) == JFileChooser.APPROVE_OPTION) {
 
@@ -3398,7 +3631,7 @@ public class SettingsDialog extends javax.swing.JDialog {
         updateFonts(filechooser, GUI_FONT, (float) (_main_panel.getZoom_factor() * 1.25));
 
         filechooser.setCurrentDirectory(new java.io.File(_download_path));
-        filechooser.setDialogTitle("Default download directory");
+        filechooser.setDialogTitle(LabelTranslatorSingleton.getInstance().translate("Default download directory"));
         filechooser.setFileSelectionMode(javax.swing.JFileChooser.DIRECTORIES_ONLY);
         filechooser.setAcceptAllFileFilterUsed(false);
 
@@ -3503,7 +3736,7 @@ public class SettingsDialog extends javax.swing.JDialog {
 
         if (!unlock_accounts_button.isVisible() || !unlock_accounts_button.isEnabled()) {
 
-            JOptionPane.showMessageDialog(this, LabelTranslatorSingleton.getInstance().translate("EMAIL1#PASS1\nEMAIL2#PASS2"), "TXT FILE FORMAT", JOptionPane.INFORMATION_MESSAGE);
+            JOptionPane.showMessageDialog(this, "EMAIL1#PASS1\nEMAIL2#PASS2", LabelTranslatorSingleton.getInstance().translate("TXT FILE FORMAT"), JOptionPane.INFORMATION_MESSAGE);
 
             javax.swing.JFileChooser filechooser = new javax.swing.JFileChooser();
 
@@ -3566,6 +3799,94 @@ public class SettingsDialog extends javax.swing.JDialog {
         }
     }//GEN-LAST:event_import_mega_buttonActionPerformed
 
+    private void export_mega_buttonActionPerformed(java.awt.event.ActionEvent evt) {
+        _exportAccounts(true);
+    }
+
+    private void export_elc_buttonActionPerformed(java.awt.event.ActionEvent evt) {
+        _exportAccounts(false);
+    }
+
+    /**
+     * Shared backend for the two export buttons. Refuses to run if the store is
+     * locked (we can't decrypt). Shows a plaintext-warning confirmation before
+     * opening the file chooser. Writes UTF-8.
+     */
+    private void _exportAccounts(boolean mega) {
+        if (_account_store.isLocked()) {
+            JOptionPane.showMessageDialog(this,
+                    LabelTranslatorSingleton.getInstance().translate("MEGA ACCOUNTS ARE LOCKED"),
+                    I18n.tr("ui.error_title"), JOptionPane.ERROR_MESSAGE);
+            return;
+        }
+
+        List<String> lines;
+        try {
+            lines = mega ? _account_store.exportMegaLines() : _account_store.exportElcLines();
+        } catch (Exception ex) {
+            LOG.log(Level.SEVERE, "Building export lines: {0}", ex.getMessage());
+            JOptionPane.showMessageDialog(this, I18n.tr("ui.err.export_failed.message", ex.getMessage()), I18n.tr("ui.err.export_failed.title"), JOptionPane.ERROR_MESSAGE);
+            return;
+        }
+
+        if (lines.isEmpty()) {
+            JOptionPane.showMessageDialog(this,
+                    LabelTranslatorSingleton.getInstance().translate("There are no accounts to export."),
+                    LabelTranslatorSingleton.getInstance().translate("Export accounts"),
+                    JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
+
+        Object[] options = {"No", LabelTranslatorSingleton.getInstance().translate("Yes")};
+        int n = showOptionDialog(this,
+                LabelTranslatorSingleton.getInstance().translate(
+                        "The exported file will contain your credentials in PLAIN TEXT. Anyone with access to the file can use your accounts.\n\nContinue?"),
+                LabelTranslatorSingleton.getInstance().translate("Export accounts"),
+                YES_NO_CANCEL_OPTION, JOptionPane.WARNING_MESSAGE, null, options, options[0]);
+        if (n != 1) {
+            return;
+        }
+
+        javax.swing.JFileChooser fc = new javax.swing.JFileChooser();
+        updateFonts(fc, GUI_FONT, (float) (_main_panel.getZoom_factor() * 1.25));
+        fc.setDialogTitle(LabelTranslatorSingleton.getInstance().translate("Export accounts"));
+        fc.setFileSelectionMode(javax.swing.JFileChooser.FILES_ONLY);
+        fc.addChoosableFileFilter(new FileNameExtensionFilter("TXT", "txt"));
+        fc.setAcceptAllFileFilterUsed(false);
+
+        String today = new java.text.SimpleDateFormat("yyyy-MM-dd").format(new java.util.Date());
+        fc.setSelectedFile(new File("megabasterd_" + (mega ? "mega" : "elc") + "_accounts_" + today + ".txt"));
+
+        if (fc.showSaveDialog(this) != JFileChooser.APPROVE_OPTION) {
+            return;
+        }
+
+        File out = fc.getSelectedFile();
+        if (!out.getName().toLowerCase().endsWith(".txt")) {
+            out = new File(out.getParentFile(), out.getName() + ".txt");
+        }
+        if (out.exists()) {
+            int overwrite = showOptionDialog(this,
+                    LabelTranslatorSingleton.getInstance().translate("File already exists. Overwrite?"),
+                    LabelTranslatorSingleton.getInstance().translate("Export accounts"),
+                    YES_NO_CANCEL_OPTION, JOptionPane.WARNING_MESSAGE, null, options, options[0]);
+            if (overwrite != 1) {
+                return;
+            }
+        }
+
+        try {
+            Files.write(out.toPath(), lines, java.nio.charset.StandardCharsets.UTF_8);
+            JOptionPane.showMessageDialog(this,
+                    I18n.tr("ui.export.success", lines.size(), out.getAbsolutePath()),
+                    LabelTranslatorSingleton.getInstance().translate("Export accounts"),
+                    JOptionPane.INFORMATION_MESSAGE);
+        } catch (IOException ex) {
+            LOG.log(Level.SEVERE, "Writing export file: {0}", ex.getMessage());
+            JOptionPane.showMessageDialog(this, I18n.tr("ui.err.export_failed.message", ex.getMessage()), I18n.tr("ui.err.export_failed.title"), JOptionPane.ERROR_MESSAGE);
+        }
+    }
+
     private void upload_public_folder_checkboxActionPerformed(java.awt.event.ActionEvent evt) {//GEN-FIRST:event_upload_public_folder_checkboxActionPerformed
         // TODO add your handling code here:
         if (this.upload_public_folder_checkbox.isSelected()) {
@@ -3603,6 +3924,7 @@ public class SettingsDialog extends javax.swing.JDialog {
     private javax.swing.JButton add_mega_account_button;
     private javax.swing.JPanel advanced_panel;
     private javax.swing.JScrollPane advanced_scrollpane;
+    private javax.swing.JCheckBox always_reload_mega_folders_checkbox;
     private javax.swing.JSpinner auto_refresh_proxy_time_spinner;
     private javax.swing.JSpinner bad_proxy_time_spinner;
     private javax.swing.JButton cancel_button;
@@ -3630,9 +3952,15 @@ public class SettingsDialog extends javax.swing.JDialog {
     private javax.swing.JTable elc_accounts_table;
     private javax.swing.JCheckBox encrypt_pass_checkbox;
     private javax.swing.JButton export_settings_button;
+    private javax.swing.JButton ext_lang_browse_button;
+    private javax.swing.JButton ext_lang_clear_button;
+    private javax.swing.JLabel ext_lang_label;
+    private javax.swing.JTextField ext_lang_path_field;
     private javax.swing.JComboBox<String> font_combo;
     private javax.swing.JLabel font_label;
     private javax.swing.JCheckBox force_smart_proxy_checkbox;
+    private javax.swing.JButton export_mega_button;
+    private javax.swing.JButton export_elc_button;
     private javax.swing.JButton import_mega_button;
     private javax.swing.JButton import_settings_button;
     private javax.swing.JButton jButton1;
@@ -3698,6 +4026,12 @@ public class SettingsDialog extends javax.swing.JDialog {
     private javax.swing.JCheckBox run_command_checkbox;
     private javax.swing.JButton run_command_test_button;
     private javax.swing.JTextField run_command_textbox;
+    private javax.swing.JCheckBox run_command_dl_finish_checkbox;
+    private javax.swing.JButton run_command_dl_finish_test_button;
+    private javax.swing.JTextField run_command_dl_finish_textbox;
+    private javax.swing.JCheckBox run_command_ul_finish_checkbox;
+    private javax.swing.JButton run_command_ul_finish_test_button;
+    private javax.swing.JTextField run_command_ul_finish_textbox;
     private javax.swing.JButton save_button;
     private javax.swing.JCheckBox smart_proxy_checkbox;
     private javax.swing.JPanel smart_proxy_settings;

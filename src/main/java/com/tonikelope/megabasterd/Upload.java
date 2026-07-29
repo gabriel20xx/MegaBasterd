@@ -13,7 +13,6 @@ import static com.tonikelope.megabasterd.MainPanel.*;
 import static com.tonikelope.megabasterd.MiscTools.*;
 import static com.tonikelope.megabasterd.Transference.PROGRESS_WATCHDOG_TIMEOUT;
 import java.io.File;
-import java.io.FileWriter;
 import java.io.IOException;
 import static java.lang.Integer.MAX_VALUE;
 import java.nio.file.Files;
@@ -396,6 +395,16 @@ public class Upload implements Transference, Runnable, SecureSingleThreadNotifia
 
         _provision_ok = false;
 
+        if (_closed || _main_panel.isExit()) {
+            // User closed this upload row, or is shutting the whole app
+            // down. Don't insert a DB row we're about to either delete
+            // (_closed) or race the SqliteSingleton shutdown for
+            // (isExit -- byebyenow closes the connection after the
+            // snapshot). The transient transference will end up in the
+            // finished_queue when isProvision_ok returns false.
+            return;
+        }
+
         if (!the_file.exists()) {
 
             _status_error = "ERROR: FILE NOT FOUND";
@@ -432,7 +441,17 @@ public class Upload implements Transference, Runnable, SecureSingleThreadNotifia
                 }
 
             } catch (SQLException ex) {
+                _status_error = "Error registering upload: " + ex.getMessage();
                 LOG.log(Level.SEVERE, ex.getMessage());
+            } catch (RuntimeException ex) {
+                // genUploadKey can NPE if the MA isn't logged in; any
+                // unexpected runtime exception used to bubble out of
+                // provisionIt back to UploadManager.provision, which had
+                // no catch, and the upload got stuck in the BoundedExecutor
+                // task with no aux_queue / finished_queue placement -- UI
+                // showed "Provisioning..." forever.
+                _status_error = "PROVISION FAILED: " + ex.getClass().getSimpleName() + (ex.getMessage() != null ? ": " + ex.getMessage() : "");
+                LOG.log(Level.SEVERE, _status_error, ex);
             }
         }
 
@@ -732,6 +751,14 @@ public class Upload implements Transference, Runnable, SecureSingleThreadNotifia
                         Logger.getLogger(Upload.class.getName()).log(Level.SEVERE, ex.getMessage());
 
                         if (Arrays.asList(FATAL_API_ERROR_CODES).contains(ex.getCode())) {
+                            // Friendly popup before we mark the upload fatal --
+                            // user needs to know the account/quota cause.
+                            // Source.ACCOUNT so -9 / -14 / -16 get the
+                            // account-context copy. (#751 / D)
+                            MegaErrorMessages.showPopup(getMain_panel().getView(), ex.getCode(),
+                                    _ma.getFull_email() != null ? _ma.getFull_email() : _file_name,
+                                    "while requesting upload URL",
+                                    MegaErrorMessages.Source.ACCOUNT);
                             stopUploader(ex.getMessage());
                             _auto_retry_on_error = Arrays.asList(FATAL_API_ERROR_CODES_WITH_RETRY).contains(ex.getCode());
                         }
@@ -890,7 +917,7 @@ public class Upload implements Transference, Runnable, SecureSingleThreadNotifia
 
                 if (!_thread_pool.isTerminated()) {
 
-                    LOG.log(Level.INFO, "{0} Closing thread pool in ''mecag\u00fcen'' style {1}...", new Object[]{Thread.currentThread().getName(), this.getFile_name()});
+                    LOG.log(Level.INFO, "{0} Forcing thread pool shutdown {1}...", new Object[]{Thread.currentThread().getName(), this.getFile_name()});
 
                     _thread_pool.shutdownNow();
                 }
@@ -1127,7 +1154,7 @@ public class Upload implements Transference, Runnable, SecureSingleThreadNotifia
                 for (int i = 3; !_closed && i > 0; i--) {
                     final int j = i;
                     MiscTools.GUIRun(() -> {
-                        getView().getRestart_button().setText("Restart (" + String.valueOf(j) + " secs...)");
+                        getView().getRestart_button().setText(I18n.tr("ui.dynamic.restart_countdown", j));
                     });
                     try {
                         Thread.sleep(1000);

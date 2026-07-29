@@ -35,13 +35,36 @@ public class UploadManager extends TransferenceManager {
         return _log_file_lock;
     }
 
+    /**
+     * #774 -- when the upload queue transitions from non-empty to empty
+     * with at least one OK finish, dispatch the user's configured
+     * post-upload-finish command. Fires independently of the download-side
+     * variant and of the legacy 509 command; if all three converge they
+     * run concurrently. {@link MainPanel#run_ul_finish_command} no-ops when
+     * the feature is disabled, so no per-call gate is needed here.
+     */
+    @Override
+    protected void onAllTransferencesFinished() {
+        MainPanel.run_ul_finish_command();
+    }
+
     @Override
     public void provision(final Transference upload) {
         MiscTools.GUIRun(() -> {
             getScroll_panel().add(((Upload) upload).getView());
         });
 
-        ((Upload) upload).provisionIt();
+        try {
+            ((Upload) upload).provisionIt();
+        } catch (RuntimeException ex) {
+            // Belt-and-braces: provisionIt now catches its own runtime
+            // exceptions, but if a future change adds a code path that
+            // throws, we must NOT leave the BoundedExecutor task without
+            // routing the transference to either aux_queue or
+            // finished_queue -- otherwise the UI shows a perpetual
+            // "Provisioning..." with no way to recover.
+            LOG.log(SEVERE, "Upload provisionIt threw -- routing to finished_queue", ex);
+        }
 
         if (((Upload) upload).isProvision_ok()) {
 

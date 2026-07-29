@@ -23,7 +23,6 @@ import java.awt.dnd.DropTargetEvent;
 import java.awt.event.WindowEvent;
 import static java.awt.event.WindowEvent.WINDOW_CLOSING;
 import java.io.File;
-import java.io.FileWriter;
 import java.io.IOException;
 import java.io.UnsupportedEncodingException;
 import java.net.URLDecoder;
@@ -161,6 +160,10 @@ public final class MainPanelView extends javax.swing.JFrame {
         return force_chunk_reset_button;
     }
 
+    public JButton getRefresh_smartproxy_button() {
+        return refresh_smartproxy_button;
+    }
+
     public JButton getUnfreeze_transferences_button() {
         return unfreeze_transferences_button;
     }
@@ -246,15 +249,54 @@ public final class MainPanelView extends javax.swing.JFrame {
 
                     MegaAPI ma = getMain_panel().getMega_active_accounts().get(mega_account);
 
+                    // Uploads require an authenticated MegaAPI (genFolderKey
+                    // / createDir / shareFolder all dereference _master_key
+                    // and _root_id). If the selected account vanished from
+                    // the active map (race with SettingsDialog) we used to
+                    // NPE silently inside the outer catch and the user saw
+                    // nothing happen.
+                    if (ma == null) {
+                        LOG.log(SEVERE, "Upload aborted: account ''{0}'' is not in mega_active_accounts (logged out / removed?)", mega_account);
+                        MiscTools.GUIRun(() -> {
+                            JOptionPane.showMessageDialog(MainPanelView.this,
+                                    LabelTranslatorSingleton.getInstance().translate("Upload aborted: the selected MEGA account is not available."),
+                                    "Error", JOptionPane.ERROR_MESSAGE);
+                        });
+                        for (File f : dialog.getFiles()) {
+                            getMain_panel().getUpload_manager().getTransference_preprocess_global_queue().remove(f);
+                        }
+                        getMain_panel().getUpload_manager().secureNotify();
+                        return;
+                    }
+
                     try {
 
                         byte[] parent_key = ma.genFolderKey();
 
                         byte[] share_key = ma.genShareKey();
 
-                        String root_name = dir_name != null ? dir_name : dialog.getFiles().get(0).getName() + "_" + genID(10);
+                        String root_name = (dir_name != null && !dir_name.isEmpty()) ? dir_name : dialog.getFiles().get(0).getName() + "_" + genID(10);
 
                         HashMap<String, Object> res = ma.createDir(root_name, ma.getRoot_id(), parent_key, i32a2bin(ma.getMaster_key()));
+
+                        if (res == null) {
+                            // createDir already logged the cause (wrapped MEGA
+                            // error or unsupported response shape) to the
+                            // DEBUG LOG tab. Only escalate to a popup if MEGA
+                            // returned a FATAL error code we recognise --
+                            // otherwise the popup would just say "EFAILED"
+                            // which is meaningless. Avoid the NPE on the next
+                            // line either way.
+                            int code = ma.getLastApiErrorCode();
+                            if (code != 0) {
+                                MegaErrorMessages.showPopup(MainPanelView.this, code,
+                                        ma.getFull_email() != null ? ma.getFull_email() : mega_account,
+                                        "while creating the upload folder on MEGA",
+                                        MegaErrorMessages.Source.ACCOUNT);
+                            }
+                            LOG.log(Level.WARNING, "{0} Upload aborted -- createDir returned null (see DEBUG LOG tab for raw MEGA response)", Thread.currentThread().getName());
+                            return;
+                        }
 
                         String parent_node = (String) ((Map) ((List) res.get("f")).get(0)).get("h");
 
@@ -291,26 +333,35 @@ public final class MainPanelView extends javax.swing.JFrame {
                             }
                         }
 
-                        if (folder_share) {
-                            res = ma.createDirInsideAnotherSharedDir(root_name, parent_node, ma.genFolderKey(), i32a2bin(ma.getMaster_key()), parent_node, share_key);
-                        } else {
-                            res = ma.createDir(root_name, parent_node, ma.genFolderKey(), i32a2bin(ma.getMaster_key()));
-
-                        }
-
-                        String file_paths_2_node = (String) ((Map) ((List) res.get("f")).get(0)).get("h");
-
+                        // Files are uploaded directly into parent_node (the
+                        // root folder we just created). The historical inner
+                        // sentinel folder used to be literally named
+                        // "MEGABASTERD"; commit 52d5ae6 (8.14, 2023) replaced
+                        // that literal with root_name, which silently turned
+                        // every upload into MEGA/root_name/root_name/<files>.
+                        // See issue #736.
                         MegaDirNode file_paths = new MegaDirNode(parent_node);
-
-                        MegaDirNode file_paths_2 = new MegaDirNode(file_paths_2_node);
-
-                        file_paths.getChildren().put(root_name, file_paths_2);
-
-                        file_paths = file_paths_2;
 
                         for (File f : dialog.getFiles()) {
 
-                            String file_path = f.getParentFile().getAbsolutePath().replace(base_path, "");
+                            if (getMain_panel().isExit()) {
+                                // App is shutting down; leave the remaining
+                                // files in preprocess_global_queue so the new
+                                // _byebye snapshot can persist them (today
+                                // limited to filename only -- TODO: extend
+                                // resumeUploads to reconstruct the parent
+                                // tree from those filenames).
+                                break;
+                            }
+
+                            // getParentFile returns null for files at a drive
+                            // root (e.g. "Z:\file.txt"). The original code
+                            // NPE'd and the outer catch silently dropped the
+                            // file. Treat it as a base-path relative file
+                            // instead.
+                            File parent = f.getParentFile();
+                            String parent_abs = parent != null ? parent.getAbsolutePath() : (base_path != null ? base_path : "");
+                            String file_path = parent_abs.replace(base_path, "");
 
                             try {
 
@@ -461,10 +512,18 @@ public final class MainPanelView extends javax.swing.JFrame {
 
             translateLabels(this);
 
-            for (JComponent c : new JComponent[]{download_status_bar, upload_status_bar, force_chunk_reset_button, unfreeze_transferences_button, global_speed_down_label, global_speed_up_label, down_remtime_label, up_remtime_label, close_all_finished_down_button, close_all_finished_up_button, pause_all_down_button, pause_all_up_button}) {
+            for (JComponent c : new JComponent[]{download_status_bar, upload_status_bar, force_chunk_reset_button, refresh_smartproxy_button, unfreeze_transferences_button, global_speed_down_label, global_speed_up_label, down_remtime_label, up_remtime_label, close_all_finished_down_button, close_all_finished_up_button, pause_all_down_button, pause_all_up_button}) {
 
                 c.setVisible(false);
             }
+
+            // Tooltip reuses the i18n key already added by #758 for the
+            // identical button inside the SettingsDialog's SmartProxy tab so
+            // we don't carry two parallel translations of the same string.
+            // setText keeps the upper-case English literal so translateLabels
+            // can route through the new `refresh_smartproxy_list_now` bundle
+            // entry, matching the pattern used by force_chunk_reset_button.
+            refresh_smartproxy_button.setToolTipText(I18n.tr("ui.smartproxy.refresh_now.tooltip"));
 
             download_status_bar.setMinimum(0);
             upload_status_bar.setMinimum(0);
@@ -574,6 +633,7 @@ public final class MainPanelView extends javax.swing.JFrame {
         down_remtime_label = new javax.swing.JLabel();
         jButton1 = new javax.swing.JButton();
         force_chunk_reset_button = new javax.swing.JButton();
+        refresh_smartproxy_button = new javax.swing.JButton();
         download_status_bar = new javax.swing.JProgressBar();
         uploads_panel = new javax.swing.JPanel();
         global_speed_up_label = new javax.swing.JLabel();
@@ -686,12 +746,25 @@ public final class MainPanelView extends javax.swing.JFrame {
             }
         });
 
+        refresh_smartproxy_button.setBackground(new java.awt.Color(0, 102, 204));
+        refresh_smartproxy_button.setFont(new java.awt.Font("Dialog", 1, 18)); // NOI18N
+        refresh_smartproxy_button.setForeground(new java.awt.Color(255, 255, 255));
+        refresh_smartproxy_button.setText("REFRESH SMARTPROXY LIST NOW");
+        refresh_smartproxy_button.setDoubleBuffered(true);
+        refresh_smartproxy_button.addActionListener(new java.awt.event.ActionListener() {
+            public void actionPerformed(java.awt.event.ActionEvent evt) {
+                refresh_smartproxy_buttonActionPerformed(evt);
+            }
+        });
+
         javax.swing.GroupLayout downloads_panelLayout = new javax.swing.GroupLayout(downloads_panel);
         downloads_panel.setLayout(downloads_panelLayout);
         downloads_panelLayout.setHorizontalGroup(
             downloads_panelLayout.createParallelGroup(javax.swing.GroupLayout.Alignment.LEADING)
             .addGroup(downloads_panelLayout.createSequentialGroup()
                 .addComponent(global_speed_down_label, javax.swing.GroupLayout.DEFAULT_SIZE, 474, Short.MAX_VALUE)
+                .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.RELATED)
+                .addComponent(refresh_smartproxy_button)
                 .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.RELATED)
                 .addComponent(force_chunk_reset_button)
                 .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.RELATED)
@@ -726,7 +799,8 @@ public final class MainPanelView extends javax.swing.JFrame {
                 .addGroup(downloads_panelLayout.createParallelGroup(javax.swing.GroupLayout.Alignment.BASELINE)
                     .addComponent(global_speed_down_label)
                     .addComponent(pause_all_down_button)
-                    .addComponent(force_chunk_reset_button)))
+                    .addComponent(force_chunk_reset_button)
+                    .addComponent(refresh_smartproxy_button)))
         );
 
         jTabbedPane1.addTab("Downloads", new javax.swing.ImageIcon(getClass().getResource("/images/icons8-download-from-ftp-30.png")), downloads_panel); // NOI18N
@@ -1043,13 +1117,17 @@ public final class MainPanelView extends javax.swing.JFrame {
         if (getMain_panel().isUse_mega_account_down()) {
             final String mega_account = (String) dialog.getUse_mega_account_down_combobox().getSelectedItem();
 
-            if ("".equals(mega_account)) {
+            if ("".equals(mega_account) || mega_account == null) {
 
                 ma = new MegaAPI();
 
             } else {
 
-                ma = getMain_panel().getMega_active_accounts().get(mega_account);
+                // The selected account may have been removed by a concurrent
+                // SettingsDialog edit, leaving get() == null; fall back to an
+                // anonymous MegaAPI rather than NPEing downstream.
+                MegaAPI selected = getMain_panel().getMega_active_accounts().get(mega_account);
+                ma = selected != null ? selected : new MegaAPI();
             }
 
         } else {
@@ -1136,10 +1214,26 @@ public final class MainPanelView extends javax.swing.JFrame {
 
                     for (String url : urls) {
 
+                        // Respect global app exit so the user closing the app
+                        // mid-batch doesn't keep spawning Downloads behind the
+                        // shutdown drain. Anything still in `urls` at this
+                        // point will be persisted by _byebye's snapshot of
+                        // _transference_preprocess_global_queue.
+                        if (getMain_panel().isExit()) {
+                            break;
+                        }
+
                         try {
 
                             link_warning = false;
 
+                            // URLDecoder.decode throws IllegalArgumentException
+                            // (not UnsupportedEncodingException) on malformed
+                            // %-escapes. Without the catch-all below a single
+                            // dodgy URL bubbled out of the for-loop, killed
+                            // the preprocess Runnable, and tripped the now-
+                            // bounded retry in TransferenceManager. Keep going
+                            // with the rest of the batch instead.
                             url = URLDecoder.decode(url, "UTF-8").replaceAll("^mega://", "https://mega.nz").trim();
 
                             Download download;
@@ -1244,6 +1338,15 @@ public final class MainPanelView extends javax.swing.JFrame {
                             LOG.log(Level.SEVERE, ex.getMessage());
                         } catch (InterruptedException ex) {
                             Logger.getLogger(MainPanelView.class.getName()).log(Level.SEVERE, ex.getMessage());
+                        } catch (RuntimeException ex) {
+                            // Last-resort: malformed URL escapes
+                            // (IllegalArgumentException), NPE from a regex that
+                            // didn't match, ClassCastException on folder_link
+                            // type, etc. -- log this URL and move on instead of
+                            // killing the rest of the batch.
+                            LOG.log(Level.SEVERE, "Skipping URL after unexpected error: " + url, ex);
+                            getMain_panel().getDownload_manager().getTransference_preprocess_global_queue().remove(url);
+                            getMain_panel().getDownload_manager().secureNotify();
                         }
 
                     }
@@ -1373,31 +1476,21 @@ public final class MainPanelView extends javax.swing.JFrame {
                 }
 
                 force_chunk_reset_button.setVisible(MainPanel.isUse_smart_proxy());
+                refresh_smartproxy_button.setVisible(MainPanel.isUse_smart_proxy());
 
                 if (MainPanel.isUse_smart_proxy()) {
 
+                    // #URL extraction is now done inside SmartMegaProxyManager
+                    // itself so multiple sources can be aggregated. (#753)
                     if (MainPanel.getProxy_manager() == null) {
-
-                        String lista_proxy = DBTools.selectSettingValue("custom_proxy_list");
-
-                        if (lista_proxy == null) {
-                            lista_proxy = "";
-                        }
-
-                        String url_list = MiscTools.findFirstRegex("^#(http.+)$", lista_proxy.trim(), 1);
-
-                        MainPanel.setProxy_manager(new SmartMegaProxyManager(url_list, _main_panel));
+                        MainPanel.setProxy_manager(new SmartMegaProxyManager(_main_panel));
                     } else {
-                        String lista_proxy = DBTools.selectSettingValue("custom_proxy_list");
-
-                        if (lista_proxy == null) {
-                            lista_proxy = "";
-                        }
-                        String url_list = MiscTools.findFirstRegex("^#(http.+)$", lista_proxy.trim(), 1);
-                        MainPanel.getProxy_manager().refreshProxyList(url_list);
+                        MainPanel.THREAD_POOL.execute(() -> MainPanel.getProxy_manager().refreshProxyList());
                     }
 
                     MainPanel.getProxy_manager().refreshSmartProxySettings();
+
+                    wakeStalledDownloadsForSmartProxy();
 
                 } else {
 
@@ -1599,6 +1692,80 @@ public final class MainPanelView extends javax.swing.JFrame {
 
     }//GEN-LAST:event_force_chunk_reset_buttonActionPerformed
 
+    /**
+     * Two-pass wake of every download that is stalled because of MEGA quota,
+     * so it picks up a just-enabled / just-refreshed SmartProxy pool without
+     * waiting out its exp-backoff or auto-retry countdown:
+     * <ol>
+     *   <li>Running downloads: break each in-flight ChunkDownloader out of its
+     *       509 / network exp-backoff sleep. Combined with the per-iteration
+     *       {@code MainPanel.getProxy_manager()} re-read in the worker loops,
+     *       this is what makes a runtime SmartProxy-enable actually resume the
+     *       download instead of leaving it frozen. (#758)</li>
+     *   <li>finished_queue downloads: break the auto-retry countdown (e.g. the
+     *       60 s {@code RESTART_COUNTDOWN_SECS_OVERQUOTA} after a -17 EOVERQUOTA
+     *       from /cs, where the chunk workers never even spawned so pass 1
+     *       can't reach them). Together with the MegaAPI -17-as-synthetic-509
+     *       escalation this delivers "downloads start again right after I
+     *       enable SmartProxy". (#760)</li>
+     * </ol>
+     * Invoked both when SmartProxy is enabled in Settings and from the manual
+     * "Refresh SmartProxy" button -- a fresh pool is exactly when stalled
+     * workers should retry immediately rather than waiting out their backoff.
+     * (#778)
+     */
+    private void wakeStalledDownloadsForSmartProxy() {
+
+        for (Transference t : _main_panel.getDownload_manager().getTransference_running_list()) {
+            if (t instanceof Download) {
+                Download dl = (Download) t;
+                for (ChunkDownloader cd : dl.getChunkworkers()) {
+                    cd.wakeFromBackoff();
+                }
+            }
+        }
+
+        for (Transference t : _main_panel.getDownload_manager().getTransference_finished_queue()) {
+            if (t instanceof Download) {
+                ((Download) t).wakeFromRetryCountdown();
+            }
+        }
+    }
+
+    private void refresh_smartproxy_buttonActionPerformed(java.awt.event.ActionEvent evt) {//GEN-FIRST:event_refresh_smartproxy_buttonActionPerformed
+
+        // Off-EDT because SmartMegaProxyManager.refreshProxyList does HTTP I/O
+        // against the configured #URL feeds, which can stall this thread for
+        // seconds if a feed is unreachable; keeping it on the EDT would freeze
+        // the whole UI. Back-to-back clicks collapse on the manager's own
+        // synchronized monitor inside refreshProxyList. Match SettingsDialog's
+        // "Refresh proxy list now" button (added in #758) so the user gets
+        // the same behaviour from either entry point. (#759)
+        SmartMegaProxyManager pm = MainPanel.getProxy_manager();
+        if (pm == null) {
+            return;
+        }
+
+        refresh_smartproxy_button.setEnabled(false);
+
+        MainPanel.THREAD_POOL.execute(() -> {
+            try {
+                pm.refreshProxyList();
+                // A fresh pool is exactly when workers stuck in 509 backoff /
+                // auto-retry countdown should retry immediately, instead of
+                // waiting out their full backoff before consulting the new
+                // list. The settings handler already does this on enable;
+                // mirror it here so the manual refresh button behaves the
+                // same. wakeFromBackoff/wakeFromRetryCountdown only flip
+                // volatile flags, so calling off-EDT is fine. (#778)
+                wakeStalledDownloadsForSmartProxy();
+            } finally {
+                MiscTools.GUIRun(() -> refresh_smartproxy_button.setEnabled(true));
+            }
+        });
+
+    }//GEN-LAST:event_refresh_smartproxy_buttonActionPerformed
+
     private void copy_all_uploadsActionPerformed(java.awt.event.ActionEvent evt) {//GEN-FIRST:event_copy_all_uploadsActionPerformed
         // TODO add your handling code here:
         int total = _main_panel.getUpload_manager().copyAllLinksToClipboard();
@@ -1623,6 +1790,7 @@ public final class MainPanelView extends javax.swing.JFrame {
     private javax.swing.JMenuItem exit_menu;
     private javax.swing.JMenu file_menu;
     private javax.swing.JButton force_chunk_reset_button;
+    private javax.swing.JButton refresh_smartproxy_button;
     private javax.swing.JLabel global_speed_down_label;
     private javax.swing.JLabel global_speed_up_label;
     private javax.swing.JMenu help_menu;

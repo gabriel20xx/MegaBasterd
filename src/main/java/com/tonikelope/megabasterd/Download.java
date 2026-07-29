@@ -82,6 +82,15 @@ public class Download implements Transference, Runnable, SecureSingleThreadNotif
     private volatile String _file_pass;
     private volatile String _file_noexpire;
     private volatile boolean _frozen;
+    /**
+     * Wall-clock millis of the most recent HTTP 509 seen by ANY worker of this
+     * download. Hoisted out of per-worker state so a single worker hitting 509
+     * flips SmartProxy mode for all other workers of the same download (the
+     * previous per-worker design meant 7 of 8 workers would keep
+     * direct-hammering MEGA after worker A had already switched to a proxy). -1
+     * == no 509 seen this download. (#751 / C4)
+     */
+    private volatile long _509_burst_timestamp = -1;
     private final boolean _use_slots;
     private volatile int _slots;
     private final boolean _restart;
@@ -95,7 +104,52 @@ public class Download implements Transference, Runnable, SecureSingleThreadNotif
     private volatile String _last_download_url;
     private volatile boolean _provision_ok;
     private boolean _auto_retry_on_error;
+    /**
+     * MEGA API error code of the most recent FATAL failure, or 0 if none.
+     * The cleanup-path auto-restart uses this to pick an error-specific
+     * countdown (currently: -17 EOVERQUOTA gets {@link
+     * Transference#RESTART_COUNTDOWN_SECS_OVERQUOTA}, everything else gets
+     * {@link Transference#RESTART_COUNTDOWN_SECS}). (#752)
+     */
+    private volatile int _last_fatal_api_error_code;
     private volatile int _paused_workers;
+
+    /**
+     * Cancels the in-flight auto-retry countdown sleep ({@link
+     * Transference#RESTART_COUNTDOWN_SECS} / {@link
+     * Transference#RESTART_COUNTDOWN_SECS_OVERQUOTA}) so the next 1 s tick
+     * inside that loop breaks early and the {@link #restart()} call fires
+     * immediately. Set by {@link #wakeFromRetryCountdown()} after the user
+     * enables SmartProxy at runtime: a download that is sitting in the
+     * finished_queue with -17 EOVERQUOTA pending a 60 s rearm would
+     * otherwise ignore the freshly-available proxy pool until the full
+     * countdown elapses. Volatile (single producer + single consumer; no
+     * CAS needed). (#760)
+     */
+    private volatile boolean _wake_from_retry_countdown = false;
+
+    /**
+     * True while the auto-retry countdown lambda spawned from the
+     * stopDownloader cleanup is actually sleeping (i.e. there is a
+     * 1 s-tick loop that {@link #_wake_from_retry_countdown} can
+     * interrupt). False after run() has either never spawned one (e.g.
+     * provisionIt failed before the cleanup path that arms the
+     * countdown), or after the countdown has finished and dispatched
+     * to {@link #_tryRestart()}. Lets {@link #wakeFromRetryCountdown()}
+     * distinguish "break the sleep" from "no sleep to break -- restart
+     * now". (#760)
+     */
+    private volatile boolean _retry_countdown_active = false;
+
+    /**
+     * Latch the dispatch of {@link #restart()} to a single caller per
+     * Download instance. Without it, a wakeFromRetryCountdown that races
+     * the countdown's natural completion (or two consecutive SmartProxy
+     * enables) would enqueue two new Downloads into the provision queue
+     * for the same URL. Used via {@link #_tryRestart()}. (#760)
+     */
+    private final java.util.concurrent.atomic.AtomicBoolean _restart_triggered =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
     private File _file;
     private boolean _checking_cbc;
     private boolean _retrying_request;
@@ -497,6 +551,62 @@ public class Download implements Transference, Runnable, SecureSingleThreadNotif
         getMain_panel().getDownload_manager().secureNotify();
     }
 
+    /**
+     * Break the in-flight auto-retry countdown so {@link #restart()} fires on
+     * the next 1 s tick instead of waiting out the full {@link
+     * Transference#RESTART_COUNTDOWN_SECS_OVERQUOTA} window. Called from
+     * MainPanelView right after the user enables SmartProxy at runtime so a
+     * download that is sitting in the finished_queue with -17 pending a 60 s
+     * rearm can immediately reissue /cs through the now-available proxy pool.
+     *
+     * Two sub-cases:
+     * <ul>
+     *   <li>A countdown lambda is actively sleeping ({@link
+     *       #_retry_countdown_active} == true): set the wake flag, the
+     *       lambda's tick loop breaks the sleep and calls {@link
+     *       #_tryRestart()} itself.</li>
+     *   <li>No countdown is active (the failure path landed before run()'s
+     *       cleanup, e.g. provisionIt threw -17 and DownloadManager._provision
+     *       moved the download straight to finished_queue with no countdown
+     *       attached): call {@link #_tryRestart()} here. The CAS in
+     *       _tryRestart ensures one-shot semantics so a stale countdown
+     *       finishing later doesn't double-restart.</li>
+     * </ul>
+     * (#760)
+     */
+    public void wakeFromRetryCountdown() {
+        if (_retry_countdown_active) {
+            _wake_from_retry_countdown = true;
+            return;
+        }
+
+        // No active countdown. Only auto-restart if this is the kind of
+        // failure that would have armed a countdown had it reached run()'s
+        // cleanup -- mirrors the predicate in stopThisSlot cleanup
+        // (Download.java:1098): _status_error != null && !_canceled &&
+        // _auto_retry_on_error. Closed / cancelled / successful downloads
+        // stay put.
+        if (_status_error != null && !_canceled && !_closed && _auto_retry_on_error) {
+            LOG.log(Level.INFO, "{0} Downloader {1} no-countdown wakeup -- triggering restart now",
+                    new Object[]{Thread.currentThread().getName(), getFile_name()});
+            _tryRestart();
+        }
+    }
+
+    /**
+     * One-shot {@link #restart()} dispatcher. Multiple callers can race
+     * (e.g. countdown lambda finishing naturally while
+     * wakeFromRetryCountdown also fires for the same download); CAS on
+     * {@link #_restart_triggered} ensures only the first one actually
+     * enqueues a new Download to the provision queue. Subsequent callers
+     * are no-ops. (#760)
+     */
+    private void _tryRestart() {
+        if (_restart_triggered.compareAndSet(false, true)) {
+            restart();
+        }
+    }
+
     @Override
     public boolean isPaused() {
         return isPause();
@@ -722,28 +832,94 @@ public class Download implements Transference, Runnable, SecureSingleThreadNotif
 
                         THREAD_POOL.execute(() -> {
 
-                            //PROGRESS WATCHDOG If a download remains more than PROGRESS_WATCHDOG_TIMEOUT seconds without receiving data, we force fatal error in order to restart it.
+                            // PROGRESS WATCHDOG. Slices its wait into 10 s chunks
+                            // so it can pick the right stall-timeout based on
+                            // live worker state: when at least one chunk worker
+                            // is in 509 backoff, use the shorter
+                            // QUOTA_STALL_TIMEOUT_DEFAULT (default 180 s) instead
+                            // of the generic 600 s. Quota stalls almost always
+                            // clear within a minute once the user activates a
+                            // VPN; making them wait 10 min for the auto-retry
+                            // path is a bad default. (#751)
                             LOG.log(Level.INFO, "{0} PROGRESS WATCHDOG HELLO!", Thread.currentThread().getName());
 
-                            long last_progress, progress = getProgress();
+                            final long generic_timeout_ms = PROGRESS_WATCHDOG_TIMEOUT * 1000L;
+                            String quota_stall_setting = selectSettingValue("quota_stall_timeout");
+                            int quota_stall_secs = QUOTA_STALL_TIMEOUT_DEFAULT;
+                            if (quota_stall_setting != null) {
+                                try {
+                                    int v = Integer.parseInt(quota_stall_setting);
+                                    if (v >= 30 && v <= 3600) {
+                                        quota_stall_secs = v;
+                                    }
+                                } catch (NumberFormatException ignore) {
+                                }
+                            }
+                            final long quota_timeout_ms = quota_stall_secs * 1000L;
 
-                            do {
-                                last_progress = progress;
+                            long last_progress = getProgress();
+                            long stall_started_ms = System.currentTimeMillis();
+                            String triggered_reason = null;
+
+                            while (!isExit() && !_thread_pool.isShutdown() && getProgress() < getFile_size()) {
 
                                 synchronized (_progress_watchdog_lock) {
                                     try {
-                                        _progress_watchdog_lock.wait(PROGRESS_WATCHDOG_TIMEOUT * 1000);
-                                        progress = getProgress();
+                                        _progress_watchdog_lock.wait(10_000L);
                                     } catch (InterruptedException ex) {
-                                        progress = -1;
-                                        Logger.getLogger(Download.class.getName()).log(Level.SEVERE, null, ex);
+                                        Thread.currentThread().interrupt();
+                                        Logger.getLogger(Download.class.getName()).log(Level.FINE, "watchdog wait interrupted");
+                                        break;
                                     }
                                 }
 
-                            } while (!isExit() && !_thread_pool.isShutdown() && progress < getFile_size() && (isPaused() || progress > last_progress));
+                                if (isPaused()) {
+                                    // Don't accumulate stall time while paused.
+                                    stall_started_ms = System.currentTimeMillis();
+                                    last_progress = getProgress();
+                                    continue;
+                                }
 
-                            if (!isExit() && !_thread_pool.isShutdown() && _status_error == null && progress < getFile_size() && progress <= last_progress) {
-                                stopDownloader("PROGRESS WATCHDOG TIMEOUT!");
+                                long current_progress = getProgress();
+                                if (current_progress > last_progress) {
+                                    stall_started_ms = System.currentTimeMillis();
+                                    last_progress = current_progress;
+                                    continue;
+                                }
+
+                                // No progress this slice. Pick the timeout.
+                                boolean any_509 = false;
+                                synchronized (_workers_lock) {
+                                    for (ChunkDownloader cd : _chunkworkers) {
+                                        if (cd.isIn_509_backoff()) {
+                                            any_509 = true;
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                long timeout_ms = any_509 ? quota_timeout_ms : generic_timeout_ms;
+                                long stalled_ms = System.currentTimeMillis() - stall_started_ms;
+
+                                if (stalled_ms >= timeout_ms) {
+                                    if (any_509) {
+                                        triggered_reason = "QUOTA STALL TIMEOUT (no progress for " + (stalled_ms / 1000) + "s on 509)";
+                                    } else {
+                                        triggered_reason = "PROGRESS WATCHDOG TIMEOUT!";
+                                    }
+                                    break;
+                                }
+                            }
+
+                            if (triggered_reason != null && !isExit() && !_thread_pool.isShutdown() && _status_error == null && getProgress() < getFile_size()) {
+                                // Flag for auto-restart so the download re-arms itself a few seconds
+                                // after the watchdog fires. The most common cause of a stale-progress
+                                // timeout is MEGA HTTP 509 (bandwidth quota) -- the user often clears
+                                // it by switching IP (VPN). Without auto-retry the download stays in
+                                // FATAL ERROR until the user manually clicks Restart on every row
+                                // (or restarts the whole app to re-provision from the queue). (#751)
+                                _auto_retry_on_error = true;
+                                stopDownloader(triggered_reason);
                             }
 
                             LOG.log(Level.INFO, "{0} PROGRESS WATCHDOG BYE BYE!", Thread.currentThread().getName());
@@ -772,7 +948,7 @@ public class Download implements Transference, Runnable, SecureSingleThreadNotif
 
                         if (!_thread_pool.isTerminated()) {
 
-                            LOG.log(Level.INFO, "{0} Closing thread pool ''mecag\u00fcen'' style...", Thread.currentThread().getName());
+                            LOG.log(Level.INFO, "{0} Forcing thread pool shutdown...", Thread.currentThread().getName());
 
                             _thread_pool.shutdownNow();
                         }
@@ -1017,21 +1193,59 @@ public class Download implements Transference, Runnable, SecureSingleThreadNotif
         });
 
         if (_status_error != null && !_canceled && _auto_retry_on_error) {
+            // MEGA's -17 (EOVERQUOTA) quota window is on the order of tens
+            // of minutes. Retrying every 3 s does not help the quota clear
+            // and just hammers the API; use a longer countdown so the user
+            // sees a meaningful "waiting for quota window" pause but a
+            // VPN/IP change still recovers within a minute. Every other
+            // FATAL_WITH_RETRY code (only -4 right now) keeps the historical
+            // 3 s pace because it clears in seconds. (#752)
+            final int countdown_secs = (_last_fatal_api_error_code == -17)
+                    ? RESTART_COUNTDOWN_SECS_OVERQUOTA
+                    : RESTART_COUNTDOWN_SECS;
+
+            // Reset the wake flag at countdown entry so a stale set() from a
+            // previous, already-fired countdown can't short-circuit this one
+            // before it has had a chance to advance even a single second.
+            // (#760)
+            _wake_from_retry_countdown = false;
+            _retry_countdown_active = true;
+
             THREAD_POOL.execute(() -> {
-                for (int i = 3; !_closed && i > 0; i--) {
-                    final int j = i;
-                    MiscTools.GUIRun(() -> {
-                        getView().getRestart_button().setText("Restart (" + String.valueOf(j) + " secs...)");
-                    });
-                    try {
-                        Thread.sleep(1000);
-                    } catch (InterruptedException ex) {
-                        LOG.log(Level.SEVERE, ex.getMessage());
+                try {
+                    for (int i = countdown_secs; !_closed && i > 0; i--) {
+                        final int j = i;
+                        MiscTools.GUIRun(() -> {
+                            getView().getRestart_button().setText(I18n.tr("ui.dynamic.restart_countdown", j));
+                        });
+                        try {
+                            Thread.sleep(1000);
+                        } catch (InterruptedException ex) {
+                            LOG.log(Level.SEVERE, ex.getMessage());
+                        }
+                        // External wakeup: user enabled SmartProxy mid-countdown.
+                        // The countdown for -17 EOVERQUOTA is 60 s and during that
+                        // window the download isn't in any running list, so the
+                        // wakeFromBackoff path used by the chunk workers cannot
+                        // reach it. Break the sleep loop so restart() fires now
+                        // and the next /cs retry goes through the proxy pool. (#760)
+                        if (_wake_from_retry_countdown) {
+                            _wake_from_retry_countdown = false;
+                            LOG.log(Level.INFO, "{0} Downloader {1} external wakeup -- breaking auto-retry countdown and restarting now",
+                                    new Object[]{Thread.currentThread().getName(), getFile_name()});
+                            break;
+                        }
                     }
-                }
-                if (!_closed) {
-                    LOG.log(Level.INFO, "{0} Downloader {1} AUTO RESTARTING DOWNLOAD...", new Object[]{Thread.currentThread().getName(), getFile_name()});
-                    restart();
+                    if (!_closed) {
+                        LOG.log(Level.INFO, "{0} Downloader {1} AUTO RESTARTING DOWNLOAD...", new Object[]{Thread.currentThread().getName(), getFile_name()});
+                        _tryRestart();
+                    }
+                } finally {
+                    // Clear before exit so a future wakeFromRetryCountdown
+                    // call (e.g. from a second SmartProxy enable) routes to
+                    // the no-countdown branch instead of futilely setting a
+                    // wake flag nobody polls. (#760)
+                    _retry_countdown_active = false;
                 }
             });
         } else {
@@ -1093,9 +1307,12 @@ public class Download implements Transference, Runnable, SecureSingleThreadNotif
                         _file_name = _file_name.replaceFirst("\\..*$", "_" + MiscTools.genID(8) + "_$0");
                     }
 
-                    if (_closed) {
-                        // User clicked Close while we were still provisioning.
-                        // Don't re-insert the row we're about to delete.
+                    if (_closed || _main_panel.isExit()) {
+                        // User clicked Close on this row, or is shutting the
+                        // whole app down. Don't insert a DB row we're about to
+                        // either delete (_closed) or race the SqliteSingleton
+                        // shutdown for (_main_panel.isExit() -- byebyenow
+                        // closes the connection right after the snapshot).
                         return;
                     }
 
@@ -1128,8 +1345,8 @@ public class Download implements Transference, Runnable, SecureSingleThreadNotif
                     _file_name = _file_name.replaceFirst("\\..*$", "_" + MiscTools.genID(8) + "_$0");
                 }
 
-                if (_closed) {
-                    // User clicked Close while we were still provisioning.
+                if (_closed || _main_panel.isExit()) {
+                    // See comment above.
                     return;
                 }
 
@@ -1253,6 +1470,15 @@ public class Download implements Transference, Runnable, SecureSingleThreadNotif
                 return _last_download_url;
             }
 
+            // Cap the worker-url refetch loop. Without this, a permanently
+            // broken MEGA link / network outage kept this synchronized block
+            // spinning forever -- and every other worker queued on
+            // _dl_url_lock, so the user could not close the download even
+            // after clicking Stop. 32 retries with exp backoff gives ~tens
+            // of minutes before giving up, which is more than enough for
+            // any transient hiccup.
+            final int MAX_URL_RETRY = 32;
+
             boolean error;
 
             int conta_error = 0;
@@ -1260,6 +1486,10 @@ public class Download implements Transference, Runnable, SecureSingleThreadNotif
             String download_url;
 
             do {
+
+                if (_exit || _main_panel.isExit()) {
+                    return _last_download_url;
+                }
 
                 error = false;
 
@@ -1285,10 +1515,17 @@ public class Download implements Transference, Runnable, SecureSingleThreadNotif
 
                     error = true;
 
+                    if (++conta_error >= MAX_URL_RETRY) {
+                        LOG.log(Level.SEVERE, "{0} getDownloadUrlForWorker giving up after {1} retries: {2}",
+                                new Object[]{Thread.currentThread().getName(), conta_error, ex.getMessage()});
+                        return null;
+                    }
+
                     try {
-                        Thread.sleep(getWaitTimeExpBackOff(conta_error++) * 1000);
+                        Thread.sleep(getWaitTimeExpBackOff(conta_error) * 1000);
                     } catch (InterruptedException ex2) {
-                        LOG.log(Level.SEVERE, ex2.getMessage());
+                        Thread.currentThread().interrupt();
+                        return _last_download_url;
                     }
                 }
 
@@ -1575,6 +1812,16 @@ public class Download implements Transference, Runnable, SecureSingleThreadNotif
                 if (Arrays.asList(FATAL_API_ERROR_CODES).contains(error_code)) {
 
                     _auto_retry_on_error = Arrays.asList(FATAL_API_ERROR_CODES_WITH_RETRY).contains(error_code);
+                    _last_fatal_api_error_code = error_code;
+
+                    // Surface a friendly explanation popup. Dedup'd so two
+                    // downloads hitting the same -16 / -8 don't pop twice.
+                    // Source.LINK so -9 / -16 etc. get the link-context copy
+                    // ("file deleted / blocked") instead of the
+                    // account-context one ("account doesn't exist"). (#751 / D)
+                    MegaErrorMessages.showPopup(getMain_panel().getView(), error_code, link,
+                            "while fetching MEGA file metadata",
+                            MegaErrorMessages.Source.LINK);
 
                     stopDownloader(error_code == -16 ? _status_error : ex.getMessage() + " " + truncateText(link, 80));
 
@@ -1596,9 +1843,9 @@ public class Download implements Transference, Runnable, SecureSingleThreadNotif
 
                     for (long i = getWaitTimeExpBackOff(retry++); i > 0 && !_exit; i--) {
                         if (error_code == -18) {
-                            getView().printStatusError(LabelTranslatorSingleton.getInstance().translate("File temporarily unavailable! (Retrying in ") + i + LabelTranslatorSingleton.getInstance().translate(" secs...)"));
+                            getView().printStatusError(I18n.tr("ui.dynamic.retry_file_unavailable", i));
                         } else {
-                            getView().printStatusError("Mega/MC APIException error " + ex.getMessage() + LabelTranslatorSingleton.getInstance().translate(" (Retrying in ") + i + LabelTranslatorSingleton.getInstance().translate(" secs...)"));
+                            getView().printStatusError(I18n.tr("ui.dynamic.retry_api_error", ex.getMessage(), i));
                         }
 
                         try {
@@ -1664,6 +1911,16 @@ public class Download implements Transference, Runnable, SecureSingleThreadNotif
                 if (Arrays.asList(FATAL_API_ERROR_CODES).contains(error_code)) {
 
                     _auto_retry_on_error = Arrays.asList(FATAL_API_ERROR_CODES_WITH_RETRY).contains(error_code);
+                    _last_fatal_api_error_code = error_code;
+
+                    // Surface a friendly explanation popup. Dedup'd so two
+                    // downloads hitting the same -16 / -8 don't pop twice.
+                    // Source.LINK so -9 / -16 etc. get the link-context copy
+                    // ("file deleted / blocked") instead of the
+                    // account-context one ("account doesn't exist"). (#751 / D)
+                    MegaErrorMessages.showPopup(getMain_panel().getView(), error_code, link,
+                            "while fetching MEGA file metadata",
+                            MegaErrorMessages.Source.LINK);
 
                     stopDownloader(error_code == -16 ? _status_error : ex.getMessage() + " " + truncateText(link, 80));
 
@@ -1827,6 +2084,24 @@ public class Download implements Transference, Runnable, SecureSingleThreadNotif
     @Override
     public boolean isFrozen() {
         return this._frozen;
+    }
+
+    /**
+     * Shared 509-burst timestamp for all workers of this download. See the
+     * field comment above. Reads + writes are unsynchronized volatile -- a race
+     * that lets two workers each set the timestamp to slightly different "now"
+     * values is fine (we only care that SOMEONE saw 509 recently). (#751 / C4)
+     */
+    public long get509BurstTimestamp() {
+        return _509_burst_timestamp;
+    }
+
+    public void set509BurstTimestamp(long ts) {
+        _509_burst_timestamp = ts;
+    }
+
+    public void reset509BurstTimestamp() {
+        _509_burst_timestamp = -1;
     }
 
     @Override

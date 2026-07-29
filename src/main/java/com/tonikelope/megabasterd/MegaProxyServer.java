@@ -12,6 +12,7 @@ package com.tonikelope.megabasterd;
 import static com.tonikelope.megabasterd.MiscTools.*;
 import java.io.*;
 import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.concurrent.ExecutorService;
@@ -214,9 +215,16 @@ public class MegaProxyServer implements Runnable {
 
                         if (matcher_auth.matches()) {
 
-                            proxy_auth = new String(BASE642Bin(matcher_auth.group(1).trim()), "UTF-8");
-
-                            LOG.log(Level.FINE, "Proxy-Authorization: [REDACTED]");
+                            try {
+                                proxy_auth = new String(BASE642Bin(matcher_auth.group(1).trim()), "UTF-8");
+                                LOG.log(Level.FINE, "Proxy-Authorization: [REDACTED]");
+                            } catch (IllegalArgumentException bad_b64) {
+                                // Malformed base64 -- treat as missing auth so the
+                                // 403 path triggers below. Don't let an unchecked
+                                // exception escape this Runnable and into the pool's
+                                // uncaught-exception handler.
+                                LOG.log(Level.FINE, "Bad base64 in Proxy-Authorization header");
+                            }
 
                         } else {
 
@@ -229,7 +237,13 @@ public class MegaProxyServer implements Runnable {
                         final Socket forwardSocket;
 
                         try {
-                            forwardSocket = new Socket(matcher.group(1), Integer.parseInt(matcher.group(2)));
+                            // Bounded connect + read timeouts so a stalled MEGA
+                            // server can't pin a handler thread until the kernel
+                            // gives up (~minutes). With 64 handlers in the pool,
+                            // a few stalls would saturate the proxy.
+                            forwardSocket = new Socket();
+                            forwardSocket.connect(new InetSocketAddress(matcher.group(1), Integer.parseInt(matcher.group(2))), 30000);
+                            forwardSocket.setSoTimeout(30000);
 
                         } catch (IOException | NumberFormatException e) {
 
@@ -315,11 +329,23 @@ public class MegaProxyServer implements Runnable {
             }
         }
 
+        // Defensive cap on header line length. Without it, a misbehaving (or
+        // malicious -- though loopback-only limits the threat surface) peer
+        // could feed an unbounded stream of non-newline bytes and slowly
+        // grow our ByteArrayOutputStream until OOM. 8 KiB is well above any
+        // realistic CONNECT request or Proxy-Authorization header.
+        private static final int MAX_HEADER_LINE_LEN = 8192;
+
         private String readLine(Socket socket) throws IOException {
+            InputStream in = socket.getInputStream();
             ByteArrayOutputStream byteArrayOutputStream = new ByteArrayOutputStream();
             int next;
+            int count = 0;
             readerLoop:
-            while ((next = socket.getInputStream().read()) != -1) {
+            while ((next = in.read()) != -1) {
+                if (++count > MAX_HEADER_LINE_LEN) {
+                    throw new IOException("Header line exceeds " + MAX_HEADER_LINE_LEN + " bytes");
+                }
                 if (_previousWasR && next == '\n') {
                     _previousWasR = false;
                     continue;

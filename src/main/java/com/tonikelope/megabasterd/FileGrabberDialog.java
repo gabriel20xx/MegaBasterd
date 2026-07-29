@@ -115,6 +115,13 @@ public class FileGrabberDialog extends javax.swing.JDialog {
         MiscTools.GUIRunAndWait(() -> {
             initComponents();
 
+            // Right-click context menu on the file tree: Remove / Keep only
+            // this / Expand all / Collapse all. Mounted once at construction
+            // time; the listener stays valid across every add_files /
+            // add_folder reload because we don't recreate the JTree instance,
+            // we just swap its model.
+            MiscTools.attachTreeContextMenu(file_tree, this::_afterTreeMutation);
+
             String upload_log_string = DBTools.selectSettingValue("upload_log");
 
             upload_log_checkbox.setSelected("yes".equals(upload_log_string));
@@ -523,7 +530,7 @@ public class FileGrabberDialog extends javax.swing.JDialog {
 
         updateFonts(filechooser, GUI_FONT, (float) (_main_panel.getZoom_factor() * 1.25));
 
-        filechooser.setDialogTitle("Add files");
+        filechooser.setDialogTitle(I18n.tr("ui.filechooser.add_files"));
 
         filechooser.setAcceptAllFileFilterUsed(false);
 
@@ -625,7 +632,7 @@ public class FileGrabberDialog extends javax.swing.JDialog {
 
         updateFonts(filechooser, GUI_FONT, (float) (_main_panel.getZoom_factor() * 1.2));
 
-        filechooser.setDialogTitle("Add directory");
+        filechooser.setDialogTitle(I18n.tr("ui.filechooser.add_directory"));
 
         filechooser.setFileSelectionMode(javax.swing.JFileChooser.DIRECTORIES_ONLY);
 
@@ -785,13 +792,28 @@ public class FileGrabberDialog extends javax.swing.JDialog {
                                 }
                             });
                         } else {
+                            // getQuota returned null -- ma.getLastApiErrorCode()
+                            // tells us WHY. Pop a friendly explanation so the
+                            // user knows whether to retry, re-login, switch
+                            // account, or contact MEGA. (#751 / D)
+                            final int err_code = (ma != null) ? ma.getLastApiErrorCode() : 0;
+                            final String err_email = (ma != null && ma.getFull_email() != null) ? ma.getFull_email() : email;
+                            if (err_code != 0) {
+                                MegaErrorMessages.showPopup(this, err_code, err_email,
+                                        "while checking account quota",
+                                        MegaErrorMessages.Source.ACCOUNT);
+                            }
                             MiscTools.GUIRun(() -> {
                                 account_combobox.setEnabled(true);
                                 account_label.setEnabled(true);
                                 account_combobox.setSelectedIndex(-1);
                                 copy_email_button.setEnabled(true);
                                 used_space_label.setForeground(Color.red);
-                                used_space_label.setText(LabelTranslatorSingleton.getInstance().translate("ERROR checking account quota!"));
+                                if (err_code != 0) {
+                                    used_space_label.setText(LabelTranslatorSingleton.getInstance().translate("ERROR checking account quota") + ": MEGA " + err_code + " (" + MegaErrorMessages.getShortName(err_code) + ")");
+                                } else {
+                                    used_space_label.setText(LabelTranslatorSingleton.getInstance().translate("ERROR checking account quota!"));
+                                }
                                 used_space_label.setEnabled(true);
                                 _last_selected_index = account_combobox.getSelectedIndex();
                                 dance_button.setEnabled(false);
@@ -810,13 +832,36 @@ public class FileGrabberDialog extends javax.swing.JDialog {
                         }
                     }
                 } catch (Exception ex) {
+                    // If the failure is itself a MegaAPIException, surface
+                    // a friendly popup; fastLogin / fetchNodes can throw -15
+                    // (dead session), -16 (blocked), etc. (#751 / D)
+                    int err_code = 0;
+                    if (ex instanceof APIException) {
+                        err_code = ((APIException) ex).getCode();
+                    } else if (ma != null) {
+                        err_code = ma.getLastApiErrorCode();
+                    }
+                    if (err_code == 0) {
+                        err_code = MegaErrorMessages.parseCodeFromMessage(ex.getMessage());
+                    }
+                    final int err_code_final = err_code;
+                    final String err_email = (ma != null && ma.getFull_email() != null) ? ma.getFull_email() : email;
+                    if (err_code_final != 0) {
+                        MegaErrorMessages.showPopup(this, err_code_final, err_email,
+                                "while logging in / checking account",
+                                MegaErrorMessages.Source.ACCOUNT);
+                    }
                     MiscTools.GUIRun(() -> {
                         account_combobox.setEnabled(true);
                         account_label.setEnabled(true);
                         account_combobox.setSelectedIndex(-1);
                         copy_email_button.setEnabled(true);
                         used_space_label.setForeground(Color.red);
-                        used_space_label.setText(LabelTranslatorSingleton.getInstance().translate("ERROR checking account quota!"));
+                        if (err_code_final != 0) {
+                            used_space_label.setText(LabelTranslatorSingleton.getInstance().translate("ERROR checking account quota") + ": MEGA " + err_code_final + " (" + MegaErrorMessages.getShortName(err_code_final) + ")");
+                        } else {
+                            used_space_label.setText(LabelTranslatorSingleton.getInstance().translate("ERROR checking account quota!"));
+                        }
                         used_space_label.setEnabled(true);
                         _last_selected_index = account_combobox.getSelectedIndex();
                         dance_button.setEnabled(false);
@@ -841,41 +886,41 @@ public class FileGrabberDialog extends javax.swing.JDialog {
     private void skip_rest_buttonActionPerformed(java.awt.event.ActionEvent evt) {//GEN-FIRST:event_skip_rest_buttonActionPerformed
 
         if (deleteAllExceptSelectedTreeItems(file_tree)) {
-
-            _genFileList();
-
-            warning_label.setEnabled(true);
-            dance_button.setEnabled(true);
-            total_file_size_label.setEnabled(true);
-            skip_button.setEnabled(true);
-            skip_rest_button.setEnabled(true);
-            dir_name_textfield.setEnabled(true);
-            dir_name_label.setEnabled(true);
+            _afterTreeMutation();
         }
     }//GEN-LAST:event_skip_rest_buttonActionPerformed
 
     private void skip_buttonActionPerformed(java.awt.event.ActionEvent evt) {//GEN-FIRST:event_skip_buttonActionPerformed
 
         if (deleteSelectedTreeItems(file_tree)) {
-
-            _genFileList();
-
-            boolean root_childs = ((TreeNode) file_tree.getModel().getRoot()).getChildCount() > 0;
-
-            warning_label.setEnabled(root_childs);
-            dance_button.setEnabled(root_childs);
-            total_file_size_label.setEnabled(root_childs);
-            skip_button.setEnabled(root_childs);
-            skip_rest_button.setEnabled(root_childs);
-            dir_name_textfield.setEnabled(root_childs);
-            dir_name_label.setEnabled(root_childs);
-
-            if (!root_childs) {
-
-                dir_name_textfield.setText("");
-            }
+            _afterTreeMutation();
         }
     }//GEN-LAST:event_skip_buttonActionPerformed
+
+    /**
+     * Post-mutation refresh shared by the REMOVE THIS / REMOVE ALL EXCEPT THIS
+     * buttons and the right-click context menu. Regenerates the file list and
+     * keeps the action controls in sync with whether anything is left in the
+     * tree (so removing every node also clears the dir_name field).
+     */
+    private void _afterTreeMutation() {
+
+        _genFileList();
+
+        boolean root_childs = ((TreeNode) file_tree.getModel().getRoot()).getChildCount() > 0;
+
+        warning_label.setEnabled(root_childs);
+        dance_button.setEnabled(root_childs);
+        total_file_size_label.setEnabled(root_childs);
+        skip_button.setEnabled(root_childs);
+        skip_rest_button.setEnabled(root_childs);
+        dir_name_textfield.setEnabled(root_childs);
+        dir_name_label.setEnabled(root_childs);
+
+        if (!root_childs) {
+            dir_name_textfield.setText("");
+        }
+    }
 
     private void copy_email_buttonActionPerformed(java.awt.event.ActionEvent evt) {//GEN-FIRST:event_copy_email_buttonActionPerformed
         // TODO add your handling code here:

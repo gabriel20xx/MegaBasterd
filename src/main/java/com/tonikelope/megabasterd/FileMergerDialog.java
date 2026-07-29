@@ -146,7 +146,7 @@ public class FileMergerDialog extends javax.swing.JDialog {
 
         if (Files.exists(Paths.get(_file_name_full + ".sha1"))) {
 
-            String sha1 = Files.readString(Paths.get(_file_name_full + ".sha1")).toLowerCase().trim();
+            String sha1 = new String(Files.readAllBytes(Paths.get(_file_name_full + ".sha1")), java.nio.charset.StandardCharsets.UTF_8).toLowerCase().trim();
 
             MiscTools.GUIRunAndWait(() -> {
                 merge_button.setText(LabelTranslatorSingleton.getInstance().translate("CHECKING FILE INTEGRITY, please wait..."));
@@ -311,7 +311,7 @@ public class FileMergerDialog extends javax.swing.JDialog {
 
         updateFonts(filechooser, GUI_FONT, (float) (_main_panel.getZoom_factor() * 1.25));
 
-        filechooser.setDialogTitle("Select any part of the original file");
+        filechooser.setDialogTitle(I18n.tr("ui.filechooser.select_file_part"));
 
         filechooser.setAcceptAllFileFilterUsed(false);
 
@@ -388,7 +388,7 @@ public class FileMergerDialog extends javax.swing.JDialog {
 
         updateFonts(filechooser, GUI_FONT, (float) (_main_panel.getZoom_factor() * 1.25));
 
-        filechooser.setDialogTitle("Add directory");
+        filechooser.setDialogTitle(I18n.tr("ui.filechooser.add_directory"));
 
         filechooser.setFileSelectionMode(javax.swing.JFileChooser.DIRECTORIES_ONLY);
 

@@ -73,6 +73,7 @@ public class MegaAPI implements Serializable {
     public static final int PBKDF2_ITERATIONS = 100000;
     public static final int PBKDF2_OUTPUT_BIT_LENGTH = 256;
     public static final int MAX_RAW_REQUEST_RETRIES = 30;
+    public static final int MAX_THUMBNAIL_UPLOAD_RETRIES = 5;
     private static final Logger LOG = Logger.getLogger(MegaAPI.class.getName());
 
     public static int checkMEGAError(String data) {
@@ -107,6 +108,24 @@ public class MegaAPI implements Serializable {
 
     private int _account_version;
 
+    /**
+     * Most recent MEGA API error code observed by RAW_REQUEST for this MegaAPI
+     * instance. Lets callers that swallowed the exception (e.g.
+     * {@link #getQuota()} returns null on failure) still surface a descriptive
+     * popup via {@link MegaErrorMessages#showPopup}. 0 means "no error since
+     * reset". Transient codes ({@link #MEGA_ERROR_NO_EXCEPTION_CODES}) are also
+     * stored so diagnostics show what just happened. (#751 / D)
+     */
+    private transient volatile int _last_api_error_code = 0;
+
+    public int getLastApiErrorCode() {
+        return _last_api_error_code;
+    }
+
+    public void resetLastApiErrorCode() {
+        _last_api_error_code = 0;
+    }
+
     private String _salt;
 
     public MegaAPI() {
@@ -133,15 +152,24 @@ public class MegaAPI implements Serializable {
     }
 
     /**
-     * Standard query parameters that MEGA's API expects on every /cs request:
-     *   &v=3       protocol version (the MEGA SDK appends this)
-     *   &ak=...    application key (user-configured if set, else MEGAcmd's
-     *              public key as fallback so we look like a known client
-     *              rather than an anonymous reverse-engineered bot)
-     *   &lang=es   user language (optional, included if set)
+     * Standard query parameters that MEGA's API expects on every /cs request.
+     * Was {@code &v=3 &ak=... &lang=...}; the {@code &v=3} part has been
+     * DROPPED. With v=3 MEGA's `p` (put/createDir) endpoint returns the
+     * new-protocol async shape {@code [<request_completion_token>, []]}
+     * instead of the legacy synchronous {@code [{node_object}]} that
+     * MegaBasterd's createDir was written for. The async shape expects the
+     * caller to subsequently poll the {@code sc} action-packet channel for
+     * the actual node data -- MegaBasterd has no plumbing for that, so the
+     * upload silently produced an "Upload aborted" with an opaque Jackson
+     * error in the DEBUG LOG (raw body
+     * {@code [["!Q|am'a", []]]}). The commit that added v=3 (2ec9de2 in
+     * master) claimed no behavioural change; in practice it broke uploads
+     * for any account that goes through the createDir path. Keeping
+     * &ak= (which fixes MEGA's 402 throttling of unknown clients) and
+     * &lang= (which is optional).
      */
     private static String _apiStdParams() {
-        StringBuilder sb = new StringBuilder("&v=3");
+        StringBuilder sb = new StringBuilder();
         String ak = (API_KEY != null && !API_KEY.isEmpty()) ? API_KEY : DEFAULT_APP_KEY;
         sb.append("&ak=").append(ak);
         String lang = MainPanel.getLanguage();
@@ -152,15 +180,14 @@ public class MegaAPI implements Serializable {
     }
 
     /**
-     * Context tag for log lines. Includes the thread name and the account
-     * email if known (login() sets _full_email; before login this is null).
-     * Used so that bug reports with multiple accounts can be diagnosed.
+     * Context tag for log lines. Includes the thread name and the account email
+     * if known (login() sets _full_email; before login this is null). Used so
+     * that bug reports with multiple accounts can be diagnosed.
      */
     private String _ctx() {
         String who = _full_email != null ? _full_email : (_email != null ? _email : "(pre-login)");
         return Thread.currentThread().getName() + " account=" + who;
     }
-
 
     private static String _redactUrl(String url) {
         if (url == null) {
@@ -296,9 +323,9 @@ public class MegaAPI implements Serializable {
 
     /**
      * Build a redacted summary of a login response so we can diagnose why a
-     * login failed without leaking the encrypted key material itself.
-     * Reports which keys are present and their lengths. Used only on the
-     * error path of _realLogin().
+     * login failed without leaking the encrypted key material itself. Reports
+     * which keys are present and their lengths. Used only on the error path of
+     * _realLogin().
      */
     private static String _describeLoginResponse(HashMap response) {
         if (response == null) {
@@ -351,7 +378,15 @@ public class MegaAPI implements Serializable {
 
     public boolean check2FA(String email) throws Exception {
 
-        String request = "[{\"a\":\"mfag\",\"e\":\"" + email + "\"}]";
+        // Strip MegaBasterd's local-only "#alias" suffix before talking to
+        // MEGA. The mfag endpoint rejects "bob@mail.com#whatever" as an
+        // unknown user (-9), which propagated up as MegaAPIException and
+        // failed the save/edit of any aliased account. login() and
+        // fastLogin() already do this split; check2FA had been missing it
+        // since 5.81 (2019). See issue #737.
+        String[] email_split = email.split(" *# *");
+
+        String request = "[{\"a\":\"mfag\",\"e\":\"" + email_split[0] + "\"}]";
 
         URL url_api = new URL(API_URL + "/cs?id=" + _nextSeqno() + _apiStdParams());
 
@@ -533,25 +568,51 @@ public class MegaAPI implements Serializable {
 
             try {
 
+                // SmartProxy routing condition for the /cs endpoint. Was
+                // keyed off HTTP 509 only; -17 (MEGA EOVERQUOTA, in the JSON
+                // body of an HTTP 200) was never reachable here because the
+                // mega_error check further down lobbed it straight up as an
+                // exception. With the "synthesise 509 on -17 when SmartProxy
+                // is enabled" branch added below, http_error == 509 now also
+                // covers the JSON-body quota case, so we don't need an extra
+                // disjunct here. (#760)
                 if ((current_smart_proxy != null || http_error == 509) && MainPanel.isUse_smart_proxy() && proxy_manager != null && !MainPanel.isUse_proxy()) {
 
                     if (current_smart_proxy != null && (http_error != 0 || empty_response)) {
 
                         proxy_manager.blockProxy(current_smart_proxy, "HTTP " + String.valueOf(http_error));
 
+                        // getProxy() returns null when every proxy is banned /
+                        // excluded and the refresh-retry loop is exhausted.
+                        // Indexing [0]/[1] unconditionally NPEs the RAW_REQUEST
+                        // -- exactly during a 509 storm, which is when SmartProxy
+                        // is supposed to save us. Same defensive pattern as
+                        // ChunkDownloader.java:362+. (#752)
                         String[] smart_proxy = proxy_manager.getProxy(excluded_proxy_list);
-
-                        current_smart_proxy = smart_proxy[0];
-
-                        smart_proxy_protocol = smart_proxy[1];
+                        if (smart_proxy != null) {
+                            current_smart_proxy = smart_proxy[0];
+                            smart_proxy_protocol = smart_proxy[1];
+                        } else {
+                            LOG.log(Level.WARNING, "{0} SmartProxy exhausted (every proxy excluded/banned) -- falling back to direct for this /cs retry", _ctx());
+                            current_smart_proxy = null;
+                            // Reset the local excluded list so the next /cs
+                            // retry re-evaluates the full pool instead of
+                            // staying locked on direct (which here means a -17
+                            // EOVERQUOTA loop). Mirrors ChunkDownloader. (#778)
+                            excluded_proxy_list.clear();
+                        }
 
                     } else if (current_smart_proxy == null) {
 
                         String[] smart_proxy = proxy_manager.getProxy(excluded_proxy_list);
-
-                        current_smart_proxy = smart_proxy[0];
-
-                        smart_proxy_protocol = smart_proxy[1];
+                        if (smart_proxy != null) {
+                            current_smart_proxy = smart_proxy[0];
+                            smart_proxy_protocol = smart_proxy[1];
+                        } else {
+                            LOG.log(Level.WARNING, "{0} SmartProxy exhausted (no usable proxy) -- falling back to direct for this /cs retry", _ctx());
+                            current_smart_proxy = null;
+                            excluded_proxy_list.clear();
+                        }
                     }
 
                     while (current_smart_proxy != null
@@ -573,8 +634,27 @@ public class MegaAPI implements Serializable {
                             con = (HttpsURLConnection) url_api.openConnection();
                         } else {
                             String[] proxy_info = current_smart_proxy.split(":");
-                            Proxy proxy = new Proxy("socks".equals(smart_proxy_protocol) ? Proxy.Type.SOCKS : Proxy.Type.HTTP, new InetSocketAddress(proxy_info[0], Integer.parseInt(proxy_info[1])));
-                            con = (HttpsURLConnection) url_api.openConnection(proxy);
+                            int proxy_port = -1;
+                            if (proxy_info.length == 2) {
+                                try {
+                                    int p = Integer.parseInt(proxy_info[1]);
+                                    if (p >= 1 && p <= 65535) {
+                                        proxy_port = p;
+                                    }
+                                } catch (NumberFormatException ignore) {
+                                }
+                            }
+
+                            if (proxy_port < 0) {
+                                LOG.log(Level.WARNING, "{0} malformed smart proxy entry {1} -- banning + direct fallback", new Object[]{_ctx(), current_smart_proxy});
+                                proxy_manager.blockProxy(current_smart_proxy, "Malformed entry");
+                                excluded_proxy_list.add(current_smart_proxy);
+                                current_smart_proxy = null;
+                                con = (HttpsURLConnection) url_api.openConnection();
+                            } else {
+                                Proxy proxy = new Proxy("socks".equals(smart_proxy_protocol) ? Proxy.Type.SOCKS : Proxy.Type.HTTP, new InetSocketAddress(proxy_info[0], proxy_port));
+                                con = (HttpsURLConnection) url_api.openConnection(proxy);
+                            }
                         }
 
                     } else {
@@ -685,9 +765,64 @@ public class MegaAPI implements Serializable {
 
                             mega_error = checkMEGAError(response);
 
+                            if (mega_error != 0) {
+                                // Stash for callers that swallow the exception
+                                // (e.g. getQuota returns null on failure) so a
+                                // UI hook can pop a friendly description. (#751 / D)
+                                _last_api_error_code = mega_error;
+                            }
+
                             if (mega_error != 0 && !Arrays.asList(MEGA_ERROR_NO_EXCEPTION_CODES).contains(mega_error)) {
 
-                                throw new MegaAPIException(mega_error);
+                                // -17 EOVERQUOTA with SmartProxy active: the
+                                // bandwidth-quota that drives -17 on anonymous
+                                // link downloads (the common case in
+                                // MegaBasterd) is tied to the egress IP, not
+                                // the account. Bubbling -17 up here would
+                                // trip Download.getMegaFileDownloadUrl ->
+                                // stopDownloader -> 60 s auto-retry countdown
+                                // -> restart -> -17 again, forever, with
+                                // SmartProxy never engaged because that path
+                                // never reached the ChunkDownloader where the
+                                // wake-from-backoff fix landed for #758.
+                                //
+                                // Treat -17 as a synthetic HTTP 509 instead:
+                                // both the SmartProxy enable condition above
+                                // and the do-while continue condition below
+                                // already key off http_error == 509, so the
+                                // next iteration of this loop picks a proxy
+                                // and reissues the /cs request through it.
+                                // Bounded by MAX_RAW_REQUEST_RETRIES so a
+                                // genuinely dead pool (or an account-scoped
+                                // -17 that SmartProxy can't bypass) still
+                                // throws within ~30 attempts. (#760)
+                                if (mega_error == -17
+                                        && MainPanel.isUse_smart_proxy()
+                                        && proxy_manager != null
+                                        && !MainPanel.isUse_proxy()
+                                        && conta_error < MAX_RAW_REQUEST_RETRIES) {
+
+                                    LOG.log(Level.WARNING, "{0} MEGA -17 EOVERQUOTA; SmartProxy enabled -- rotating /cs through proxy pool (attempt {1}/{2})",
+                                            new Object[]{_ctx(), conta_error + 1, MAX_RAW_REQUEST_RETRIES});
+
+                                    // Flip http_error so the routing /
+                                    // continue predicates trigger. Clear the
+                                    // parsed body so the post-loop return
+                                    // doesn't hand a -17-bearing response
+                                    // back to the caller. Bump conta_error
+                                    // explicitly because the backoff branch
+                                    // below is gated on http_error != 509
+                                    // and would otherwise leave the counter
+                                    // at zero forever.
+                                    http_error = 509;
+                                    response = null;
+                                    empty_response = false;
+                                    conta_error++;
+
+                                } else {
+
+                                    throw new MegaAPIException(mega_error);
+                                }
 
                             }
 
@@ -1052,7 +1187,11 @@ public class MegaAPI implements Serializable {
 
             file_bytes[1] = _encThumbAttr(Files.readAllBytes(files[1].toPath()), upload.getByte_file_key());
 
-            String request = "[{\"a\":\"ufa\", \"s\":" + String.valueOf(file_bytes[0].length) + ", \"ssl\":1}, {\"a\":\"ufa\", \"s\":" + String.valueOf(file_bytes[1].length) + ", \"ssl\":1}]";
+            // No "ssl":1 here on purpose: the attribute (thumbnail) data is already AES-CBC encrypted
+            // with the file key, so it travels over plain HTTP just like the file chunks. Forcing TLS
+            // against MEGA's gfs storage nodes was the only HTTPS hop in the upload pipeline and caused
+            // intermittent SSLHandshakeException (handshake_failure) that silently dropped thumbnails.
+            String request = "[{\"a\":\"ufa\", \"s\":" + String.valueOf(file_bytes[0].length) + "}, {\"a\":\"ufa\", \"s\":" + String.valueOf(file_bytes[1].length) + "}]";
 
             URL url_api = new URL(API_URL + "/cs?id=" + _nextSeqno() + (_sid != null ? "&sid=" + _sid : "") + _apiStdParams());
 
@@ -1072,53 +1211,72 @@ public class MegaAPI implements Serializable {
 
                 URL url = new URL(u);
 
-                HttpURLConnection con = null;
+                int conta_error = 0;
 
-                try {
+                while (true) {
 
-                    con = (HttpURLConnection) url.openConnection();
+                    HttpURLConnection con = null;
 
-                    con.setConnectTimeout(Transference.HTTP_CONNECT_TIMEOUT);
+                    try {
 
-                    con.setReadTimeout(Transference.HTTP_READ_TIMEOUT);
+                        con = (HttpURLConnection) url.openConnection();
 
-                    con.setRequestMethod("POST");
+                        con.setConnectTimeout(Transference.HTTP_CONNECT_TIMEOUT);
 
-                    con.setDoOutput(true);
+                        con.setReadTimeout(Transference.HTTP_READ_TIMEOUT);
 
-                    con.setUseCaches(false);
+                        con.setRequestMethod("POST");
 
-                    con.setRequestProperty("User-Agent", MainPanel.DEFAULT_USER_AGENT);
+                        con.setDoOutput(true);
 
-                    byte[] buffer = new byte[8192];
+                        con.setUseCaches(false);
 
-                    int reads;
+                        con.setRequestProperty("User-Agent", MainPanel.DEFAULT_USER_AGENT);
 
-                    try (OutputStream out = new ThrottledOutputStream(con.getOutputStream(), upload.getMain_panel().getStream_supervisor())) {
+                        byte[] buffer = new byte[8192];
 
-                        out.write(file_bytes[h]);
-                    }
+                        int reads;
 
-                    int status = con.getResponseCode();
+                        try (OutputStream out = new ThrottledOutputStream(con.getOutputStream(), upload.getMain_panel().getStream_supervisor())) {
 
-                    if (status != 200) {
-                        MiscTools.drainAndCloseErrorStream(con);
-                        throw new IOException("Thumbnail upload failed: HTTP " + status);
-                    }
-
-                    try (InputStream is = con.getInputStream(); ByteArrayOutputStream byte_res = new ByteArrayOutputStream()) {
-
-                        while ((reads = is.read(buffer)) != -1) {
-                            byte_res.write(buffer, 0, reads);
+                            out.write(file_bytes[h]);
                         }
 
-                        hash[h] = MiscTools.Bin2UrlBASE64(byte_res.toByteArray());
+                        int status = con.getResponseCode();
 
-                    }
+                        if (status != 200) {
+                            MiscTools.drainAndCloseErrorStream(con);
+                            throw new IOException("Thumbnail upload failed: HTTP " + status);
+                        }
 
-                } finally {
-                    if (con != null) {
-                        con.disconnect();
+                        try (InputStream is = con.getInputStream(); ByteArrayOutputStream byte_res = new ByteArrayOutputStream()) {
+
+                            while ((reads = is.read(buffer)) != -1) {
+                                byte_res.write(buffer, 0, reads);
+                            }
+
+                            hash[h] = MiscTools.Bin2UrlBASE64(byte_res.toByteArray());
+
+                        }
+
+                        break;
+
+                    } catch (IOException ex) {
+
+                        if (upload.isStopped() || ++conta_error >= MAX_THUMBNAIL_UPLOAD_RETRIES) {
+                            throw ex;
+                        }
+
+                        long wait_time = MiscTools.getWaitTimeExpBackOff(conta_error);
+
+                        LOG.log(Level.WARNING, "{0} Thumbnail upload error ({1}), retrying in {2} secs... ({3}/{4})", new Object[]{Thread.currentThread().getName(), ex.getMessage(), wait_time, conta_error, MAX_THUMBNAIL_UPLOAD_RETRIES});
+
+                        MiscTools.pausar(wait_time * 1000);
+
+                    } finally {
+                        if (con != null) {
+                            con.disconnect();
+                        }
                     }
                 }
 
@@ -1219,16 +1377,85 @@ public class MegaAPI implements Serializable {
 
             String res = RAW_REQUEST(request, url_api);
 
+            // Handle the per-target wrapped error shape `[[-N]]` that MEGA can
+            // return for "p" requests (e.g. parent node was deleted between
+            // login and createDir). checkMEGAError in RAW_REQUEST only matches
+            // top-level `-N` / `[-N]`, so a `[[-9]]` slipped through to Jackson
+            // and exploded with a MismatchedInputException + visible stack
+            // trace, surfacing as a confusing "uploads fail" symptom.
+            int wrapped = _checkWrappedMEGAError(res);
+            if (wrapped != 0) {
+                _last_api_error_code = wrapped;
+                LOG.log(Level.WARNING, "{0} createDir: MEGA returned wrapped error {1}",
+                        new Object[]{_ctx(), wrapped});
+                return null;
+            }
+
             ObjectMapper objectMapper = new ObjectMapper();
 
-            res_map = objectMapper.readValue(res, HashMap[].class);
+            try {
+                res_map = objectMapper.readValue(res, HashMap[].class);
+            } catch (com.fasterxml.jackson.databind.exc.MismatchedInputException jex) {
+                // MEGA returned something that doesn't fit `[{...}]`. Common
+                // case: the per-target wrapped shape `[[{...}]]` (Jackson 2.18
+                // refuses to coerce that into HashMap[], where 2.15 used to
+                // muddle through with a partial result). Try unwrapping one
+                // level via JsonNode before giving up.
+                LOG.log(Level.WARNING, "{0} createDir: HashMap[] parse rejected, attempting one-level unwrap. Raw body (truncated): {1}",
+                        new Object[]{_ctx(), _truncateForLog(res, 500)});
+                try {
+                    com.fasterxml.jackson.databind.JsonNode root = objectMapper.readTree(res);
+                    if (root.isArray() && root.size() > 0 && root.get(0).isArray()) {
+                        com.fasterxml.jackson.databind.JsonNode inner = root.get(0);
+                        res_map = objectMapper.treeToValue(inner, HashMap[].class);
+                        LOG.log(Level.INFO, "{0} createDir: unwrapped one extra MEGA array layer successfully", _ctx());
+                    } else {
+                        LOG.log(Level.SEVERE, "{0} createDir: unsupported response shape; raw body (truncated): {1}",
+                                new Object[]{_ctx(), _truncateForLog(res, 500)});
+                    }
+                } catch (Exception ex2) {
+                    LOG.log(Level.SEVERE, "{0} createDir: unwrap attempt also failed: {1}; raw body (truncated): {2}",
+                            new Object[]{_ctx(), ex2.getMessage(), _truncateForLog(res, 500)});
+                }
+            }
 
         } catch (Exception ex) {
             LOG.log(Level.SEVERE, _ctx(), ex);
         }
 
-        return res_map != null ? res_map[0] : null;
+        return res_map != null && res_map.length > 0 ? res_map[0] : null;
 
+    }
+
+    private static String _truncateForLog(String s, int max) {
+        if (s == null) {
+            return "(null)";
+        }
+        if (s.length() <= max) {
+            return s;
+        }
+        return s.substring(0, max) + "...(" + (s.length() - max) + " more chars)";
+    }
+
+    /**
+     * Returns N (negative) if the response is a doubly-wrapped per-target
+     * error like {@code [[-9]]}, else 0. Centralised so other "p"-style
+     * callers (createDirInsideAnotherSharedDir, finishUploadFile, etc.) can
+     * apply the same guard without duplicating the regex. (#751 follow-up)
+     */
+    static int _checkWrappedMEGAError(String data) {
+        if (data == null) {
+            return 0;
+        }
+        String m = findFirstRegex("^\\[\\s*\\[\\s*(\\-[0-9]+)\\s*\\]\\s*\\]$", data, 1);
+        if (m == null) {
+            return 0;
+        }
+        try {
+            return Integer.parseInt(m);
+        } catch (NumberFormatException ex) {
+            return 0;
+        }
     }
 
     public HashMap<String, Object> createDirInsideAnotherSharedDir(String name, String parent_node, byte[] node_key, byte[] master_key, String root_node, byte[] share_key) {
@@ -1384,7 +1611,15 @@ public class MegaAPI implements Serializable {
 
     public static final long FOLDER_CACHE_MAX_AGE_MS = 24L * 60L * 60L * 1000L;
 
+    private static boolean isAlwaysReloadMegaFoldersEnabled() {
+        return "yes".equals(DBTools.selectSettingValue("always_reload_mega_folders"));
+    }
+
     public boolean existsCachedFolderNodes(String folder_id) {
+
+        if (isAlwaysReloadMegaFoldersEnabled()) {
+            return false;
+        }
 
         java.nio.file.Path p = Paths.get(_folderCachePath(folder_id));
 
@@ -1448,7 +1683,7 @@ public class MegaAPI implements Serializable {
         HashMap<String, Object> folder_nodes = null;
         String res = null;
 
-        if (cache) {
+        if (cache && !isAlwaysReloadMegaFoldersEnabled()) {
             res = getCachedFolderNodes(folder_id);
         }
 
@@ -1543,6 +1778,12 @@ public class MegaAPI implements Serializable {
                 }
 
                 folder_nodes.put((String) node.get("h"), the_node);
+            } else {
+                // Silent skip turned the folder dialog into a partial/empty
+                // tree with no clue why; surface a WARNING so users hitting
+                // odd "missing files" cases have something to report.
+                LOG.log(Level.WARNING, "MEGA FOLDER {0}: node {1} dropped (no segment of k=''{2}'' decrypted ''a'')",
+                        new Object[]{folder_id, node.get("h"), full_k});
             }
         }
 
@@ -1554,7 +1795,7 @@ public class MegaAPI implements Serializable {
         HashMap<String, Object> folder_nodes = null;
         String res = null;
 
-        if (cache) {
+        if (cache && !isAlwaysReloadMegaFoldersEnabled()) {
             res = getCachedFolderNodes(folder_id);
         }
 
@@ -1685,7 +1926,15 @@ public class MegaAPI implements Serializable {
 
         HashMap<String, ArrayList<String>> map = new HashMap<>();
 
+        // Track which #F* links failed to convert so the caller can decide
+        // whether to drop them or report them to the user instead of silently
+        // losing the input (previously: if the regex didn't match, folder_id /
+        // folder_key / file_id were all null and the link got buried under the
+        // sentinel "null:null" key, which then failed at getFolderNodes time
+        // and yielded an empty nlinks list -- the caller's removeAll() then
+        // wiped the original #F* link with nothing to replace it).
         ArrayList<String> nlinks = new ArrayList<>();
+        ArrayList<String> malformed_originals = new ArrayList<>();
 
         for (String link : links) {
 
@@ -1695,22 +1944,27 @@ public class MegaAPI implements Serializable {
 
             String file_id = findFirstRegex("#F\\*([^!]+)", link, 1);
 
-            if (!map.containsKey(folder_id + ":" + folder_key)) {
-
-                ArrayList<String> lista = new ArrayList<>();
-
-                lista.add(file_id);
-
-                map.put(folder_id + ":" + folder_key, lista);
-
-            } else {
-
-                map.get(folder_id + ":" + folder_key).add(file_id);
-
+            if (folder_id == null || folder_key == null || file_id == null) {
+                LOG.log(Level.WARNING, "#F* link did not match expected shape, skipping: {0}", link);
+                malformed_originals.add(link);
+                continue;
             }
+
+            map.computeIfAbsent(folder_id + ":" + folder_key, k -> new ArrayList<>()).add(file_id);
         }
 
+        // If the user is closing the app mid-batch, skip the cache-prompt
+        // loop entirely -- the surviving #F* originals are preserved via
+        // malformed_originals + the caller's preprocess_global_queue, so
+        // they'll be picked up on the next launch.
+        MainPanel main_panel = MainPanelView.getINSTANCE() != null ? MainPanelView.getINSTANCE().getMain_panel() : null;
+        boolean exiting = main_panel != null && main_panel.isExit();
+
         for (Map.Entry<String, ArrayList<String>> entry : map.entrySet()) {
+
+            if (exiting) {
+                break;
+            }
 
             String[] folder_parts = entry.getKey().split(":");
 
@@ -1720,7 +1974,7 @@ public class MegaAPI implements Serializable {
                 final int[] rr = {-1};
                 final String fid = folder_parts[0];
                 MiscTools.GUIRunAndWait(() -> {
-                    rr[0] = JOptionPane.showConfirmDialog(MainPanelView.getINSTANCE(), "Do you want to use FOLDER [" + fid + "] CACHED VERSION?\n\n(It could speed up the loading of very large folders)", "FOLDER CACHE", JOptionPane.YES_NO_OPTION);
+                    rr[0] = JOptionPane.showConfirmDialog(MainPanelView.getINSTANCE(), I18n.tr("ui.confirm.folder_cache.message_with_id", fid), I18n.tr("ui.confirm.folder_cache.title"), JOptionPane.YES_NO_OPTION);
                 });
                 r = rr[0];
             }
@@ -1732,6 +1986,11 @@ public class MegaAPI implements Serializable {
             }
 
         }
+
+        // Echo back malformed originals so the caller's
+        // urls.removeAll(folder_file_links); urls.addAll(nlinks)
+        // pattern does not silently destroy them.
+        nlinks.addAll(malformed_originals);
 
         return nlinks;
 
@@ -1751,9 +2010,20 @@ public class MegaAPI implements Serializable {
 
                 if (node != null && node.get("key") != null) {
                     nlinks.add("https://mega.nz/#N!" + file_id + "!" + (String) node.get("key") + "###n=" + folder_id);
+                } else {
+                    // Silently dropping a file id the user explicitly pasted
+                    // (because MEGA didn't return it, e.g. the file was
+                    // deleted or the folder key didn't unwrap it) is the
+                    // exact thing that makes folder-link downloads "look
+                    // like nothing happened". Surface it.
+                    LOG.log(Level.WARNING, "MEGA folder {0}: file id {1} not present or has no key, dropped",
+                            new Object[]{folder_id, file_id});
                 }
             }
 
+        } else {
+
+            throw new Exception("getFolderNodes returned null for folder " + folder_id);
         }
 
         return nlinks;

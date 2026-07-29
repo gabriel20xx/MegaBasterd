@@ -43,6 +43,25 @@ public class StreamChunkDownloader implements Runnable {
         _exit = exit;
     }
 
+    /**
+     * Returns the port number for a "host:port" smart-proxy entry, or -1 if the
+     * entry is malformed (no colon, non-numeric port, or out of range).
+     * Centralises the defensive parse so both the smart-proxy branch and the
+     * fallback path in run() can use the same guard. (#751)
+     */
+    private static int parseProxyPort(String proxy) {
+        String[] parts = proxy.split(":");
+        if (parts.length != 2) {
+            return -1;
+        }
+        try {
+            int p = Integer.parseInt(parts[1]);
+            return (p >= 1 && p <= 65535) ? p : -1;
+        } catch (NumberFormatException ex) {
+            return -1;
+        }
+    }
+
     @Override
     public void run() {
 
@@ -68,11 +87,18 @@ public class StreamChunkDownloader implements Runnable {
 
             if (MainPanel.isUse_smart_proxy() && proxy_manager != null && proxy_manager.isForce_smart_proxy()) {
 
+                // getProxy() returns null when no proxy is usable. Was indexed
+                // unconditionally -> NPE at startup if the remote list is empty
+                // or every entry is banned. (#751)
                 String[] smart_proxy = proxy_manager.getProxy(excluded_proxy_list);
 
-                current_smart_proxy = smart_proxy[0];
-
-                smart_proxy_protocol = smart_proxy[1];
+                if (smart_proxy != null) {
+                    current_smart_proxy = smart_proxy[0];
+                    smart_proxy_protocol = smart_proxy[1];
+                } else {
+                    LOG.log(Level.WARNING, "{0} StreamWorker [{1}] SmartProxy force-mode: no proxies available -- starting direct", new Object[]{Thread.currentThread().getName(), _id});
+                    current_smart_proxy = null;
+                }
 
                 while (current_smart_proxy != null
                         && ("ikev2".equals(smart_proxy_protocol) || "wireguard".equals(smart_proxy_protocol))
@@ -89,6 +115,16 @@ public class StreamChunkDownloader implements Runnable {
             }
 
             while (!_exit && !_chunkmanager.isExit()) {
+
+                // Re-read the manager every iteration so enabling SmartProxy at
+                // runtime is observed by an already-running stream worker
+                // (mirrors ChunkDownloader.run / ChunkDownloaderMono.run).
+                // Capturing it once before the loop (the line ~84 read) left
+                // proxy_manager null for the worker's whole life when streaming
+                // started with SmartProxy OFF -- and the routing branch below
+                // did not null-guard it, so the first 509 after a runtime enable
+                // NPE'd at proxy_manager.getProxy()/blockProxy(). (#778)
+                proxy_manager = MainPanel.getProxy_manager();
 
                 while (!_exit && !_chunkmanager.isExit() && _chunkmanager.getChunk_queue().size() >= StreamChunkManager.BUFFER_CHUNKS_SIZE) {
 
@@ -110,7 +146,7 @@ public class StreamChunkDownloader implements Runnable {
 
                     StreamChunk chunk_stream = new StreamChunk(offset, _chunkmanager.calculateChunkSize(offset), url);
 
-                    if ((current_smart_proxy != null || http_error == 509) && MainPanel.isUse_smart_proxy() && !MainPanel.isUse_proxy()) {
+                    if ((current_smart_proxy != null || http_error == 509) && MainPanel.isUse_smart_proxy() && proxy_manager != null && !MainPanel.isUse_proxy()) {
 
                         if (current_smart_proxy != null && http_error != 0) {
 
@@ -118,17 +154,30 @@ public class StreamChunkDownloader implements Runnable {
 
                             String[] smart_proxy = proxy_manager.getProxy(excluded_proxy_list);
 
-                            current_smart_proxy = smart_proxy[0];
-
-                            smart_proxy_protocol = smart_proxy[1];
+                            if (smart_proxy != null) {
+                                current_smart_proxy = smart_proxy[0];
+                                smart_proxy_protocol = smart_proxy[1];
+                            } else {
+                                LOG.log(Level.WARNING, "{0} StreamWorker [{1}] SmartProxy exhausted -- falling back to direct", new Object[]{Thread.currentThread().getName(), _id});
+                                current_smart_proxy = null;
+                                // Reset so the next iteration re-evaluates the
+                                // full pool instead of locking onto direct.
+                                // Mirrors ChunkDownloader. (#778)
+                                excluded_proxy_list.clear();
+                            }
 
                         } else if (current_smart_proxy == null) {
 
                             String[] smart_proxy = proxy_manager.getProxy(excluded_proxy_list);
 
-                            current_smart_proxy = smart_proxy[0];
-
-                            smart_proxy_protocol = smart_proxy[1];
+                            if (smart_proxy != null) {
+                                current_smart_proxy = smart_proxy[0];
+                                smart_proxy_protocol = smart_proxy[1];
+                            } else {
+                                LOG.log(Level.WARNING, "{0} StreamWorker [{1}] SmartProxy exhausted -- falling back to direct", new Object[]{Thread.currentThread().getName(), _id});
+                                current_smart_proxy = null;
+                                excluded_proxy_list.clear();
+                            }
 
                         }
 
@@ -151,9 +200,19 @@ public class StreamChunkDownloader implements Runnable {
                             if ("ikev2".equals(smart_proxy_protocol) || "wireguard".equals(smart_proxy_protocol)) {
                                 con = (HttpURLConnection) chunk_url.openConnection();
                             } else {
-                                String[] proxy_info = current_smart_proxy.split(":");
-                                Proxy proxy = new Proxy("socks".equals(smart_proxy_protocol) ? Proxy.Type.SOCKS : Proxy.Type.HTTP, new InetSocketAddress(proxy_info[0], Integer.parseInt(proxy_info[1])));
-                                con = (HttpURLConnection) chunk_url.openConnection(proxy);
+                                int proxy_port = parseProxyPort(current_smart_proxy);
+                                if (proxy_port < 0) {
+                                    LOG.log(Level.WARNING, "{0} StreamWorker [{1}] malformed smart proxy entry {2} -- banning + direct fallback",
+                                            new Object[]{Thread.currentThread().getName(), _id, current_smart_proxy});
+                                    proxy_manager.blockProxy(current_smart_proxy, "Malformed entry");
+                                    excluded_proxy_list.add(current_smart_proxy);
+                                    current_smart_proxy = null;
+                                    con = (HttpURLConnection) chunk_url.openConnection();
+                                } else {
+                                    String[] proxy_info = current_smart_proxy.split(":");
+                                    Proxy proxy = new Proxy("socks".equals(smart_proxy_protocol) ? Proxy.Type.SOCKS : Proxy.Type.HTTP, new InetSocketAddress(proxy_info[0], proxy_port));
+                                    con = (HttpURLConnection) chunk_url.openConnection(proxy);
+                                }
                             }
 
                         } else {
@@ -182,10 +241,22 @@ public class StreamChunkDownloader implements Runnable {
                                 if ("ikev2".equals(smart_proxy_protocol) || "wireguard".equals(smart_proxy_protocol)) {
                                     con = (HttpURLConnection) chunk_url.openConnection();
                                 } else {
-                                    String[] proxy_info = current_smart_proxy.split(":");
-                                    Proxy proxy = new Proxy("socks".equals(smart_proxy_protocol) ? Proxy.Type.SOCKS : Proxy.Type.HTTP, new InetSocketAddress(proxy_info[0], Integer.parseInt(proxy_info[1])));
-                                    con = (HttpURLConnection) chunk_url.openConnection(proxy);
-                                }
+                                    int proxy_port = parseProxyPort(current_smart_proxy);
+                                    if (proxy_port < 0) {
+                                        LOG.log(Level.WARNING, "{0} StreamWorker [{1}] malformed smart proxy entry {2} -- banning + direct fallback",
+                                                new Object[]{Thread.currentThread().getName(), _id, current_smart_proxy});
+                                        if (proxy_manager != null) {
+                                            proxy_manager.blockProxy(current_smart_proxy, "Malformed entry");
+                                        }
+                                        excluded_proxy_list.add(current_smart_proxy);
+                                        current_smart_proxy = null;
+                                        con = (HttpURLConnection) chunk_url.openConnection();
+                                    } else {
+                                        String[] proxy_info = current_smart_proxy.split(":");
+                                        Proxy proxy = new Proxy("socks".equals(smart_proxy_protocol) ? Proxy.Type.SOCKS : Proxy.Type.HTTP, new InetSocketAddress(proxy_info[0], proxy_port));
+                                        con = (HttpURLConnection) chunk_url.openConnection(proxy);
+                                    }
+                                 }
 
                             } else {
                                 con = (HttpURLConnection) chunk_url.openConnection();

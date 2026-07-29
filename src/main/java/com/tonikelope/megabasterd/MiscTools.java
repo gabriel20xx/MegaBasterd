@@ -98,6 +98,7 @@ import javax.swing.JMenu;
 import javax.swing.JMenuItem;
 import javax.swing.JOptionPane;
 import javax.swing.JPanel;
+import javax.swing.JPopupMenu;
 import javax.swing.JTree;
 import javax.swing.SwingUtilities;
 import javax.swing.UIDefaults;
@@ -563,50 +564,66 @@ public class MiscTools {
 
     public static void translateLabels(final Component component) {
 
-        if (component != null) {
+        if (component == null) {
+            return;
+        }
 
-            if (component instanceof javax.swing.JLabel) {
+        // Tooltips live on every JComponent regardless of subtype; translate
+        // them up-front so JSpinner / JTextField / JComboBox tooltips are also
+        // covered (previously only JLabel/JButton/JCheckBox text was).
+        if (component instanceof JComponent) {
+            JComponent jc = (JComponent) component;
+            String tip = jc.getToolTipText();
+            if (tip != null && !tip.isEmpty()) {
+                jc.setToolTipText(LabelTranslatorSingleton.getInstance().translate(tip));
+            }
+        }
 
-                ((JLabel) component).setText(LabelTranslatorSingleton.getInstance().translate(((JLabel) component).getText()));
+        if (component instanceof javax.swing.JLabel) {
 
-            } else if (component instanceof javax.swing.JButton) {
+            ((JLabel) component).setText(LabelTranslatorSingleton.getInstance().translate(((JLabel) component).getText()));
 
-                ((AbstractButton) component).setText(LabelTranslatorSingleton.getInstance().translate(((AbstractButton) component).getText()));
+        } else if (component instanceof javax.swing.JButton) {
 
-            } else if (component instanceof javax.swing.JCheckBox) {
+            ((AbstractButton) component).setText(LabelTranslatorSingleton.getInstance().translate(((AbstractButton) component).getText()));
 
-                ((AbstractButton) component).setText(LabelTranslatorSingleton.getInstance().translate(((AbstractButton) component).getText()));
+        } else if (component instanceof javax.swing.JCheckBox) {
 
-            } else if ((component instanceof JMenuItem) && !(component instanceof JMenu)) {
+            ((AbstractButton) component).setText(LabelTranslatorSingleton.getInstance().translate(((AbstractButton) component).getText()));
 
-                ((AbstractButton) component).setText(LabelTranslatorSingleton.getInstance().translate(((AbstractButton) component).getText()));
+        } else if (component instanceof javax.swing.JRadioButton) {
 
-            } else if (component instanceof JMenu) {
+            ((AbstractButton) component).setText(LabelTranslatorSingleton.getInstance().translate(((AbstractButton) component).getText()));
 
-                for (Component child : ((JMenu) component).getMenuComponents()) {
-                    if (child instanceof JMenuItem) {
-                        translateLabels(child);
-                    }
+        } else if ((component instanceof JMenuItem) && !(component instanceof JMenu)) {
+
+            ((AbstractButton) component).setText(LabelTranslatorSingleton.getInstance().translate(((AbstractButton) component).getText()));
+
+        } else if (component instanceof JMenu) {
+
+            for (Component child : ((JMenu) component).getMenuComponents()) {
+                if (child instanceof JMenuItem) {
+                    translateLabels(child);
                 }
+            }
 
-                ((AbstractButton) component).setText(LabelTranslatorSingleton.getInstance().translate(((AbstractButton) component).getText()));
+            ((AbstractButton) component).setText(LabelTranslatorSingleton.getInstance().translate(((AbstractButton) component).getText()));
 
-            } else if (component instanceof Container) {
+        } else if (component instanceof Container) {
 
-                for (Component child : ((Container) component).getComponents()) {
-                    if (child instanceof Container) {
+            for (Component child : ((Container) component).getComponents()) {
+                if (child instanceof Container) {
 
-                        translateLabels(child);
-                    }
+                    translateLabels(child);
                 }
+            }
 
-                if ((component instanceof JPanel) && (((JComponent) component).getBorder() instanceof TitledBorder)) {
-                    ((TitledBorder) ((JComponent) component).getBorder()).setTitle(LabelTranslatorSingleton.getInstance().translate(((TitledBorder) ((JComponent) component).getBorder()).getTitle()));
-                }
+            if ((component instanceof JPanel) && (((JComponent) component).getBorder() instanceof TitledBorder)) {
+                ((TitledBorder) ((JComponent) component).getBorder()).setTitle(LabelTranslatorSingleton.getInstance().translate(((TitledBorder) ((JComponent) component).getBorder()).getTitle()));
+            }
 
-                if (component instanceof JDialog) {
-                    ((Dialog) component).setTitle(LabelTranslatorSingleton.getInstance().translate(((Dialog) component).getTitle()));
-                }
+            if (component instanceof JDialog) {
+                ((Dialog) component).setTitle(LabelTranslatorSingleton.getInstance().translate(((Dialog) component).getTitle()));
             }
         }
     }
@@ -1085,6 +1102,96 @@ public class MiscTools {
         return false;
     }
 
+    /**
+     * Mount a right-click context menu on the JTree used by FolderLinkDialog
+     * and FileGrabberDialog. Replaces the Ctrl+click + "REMOVE THIS" button
+     * workflow: right-click on a node directly to remove it, with multi-
+     * selection still honoured if the user clicked on an already-selected
+     * node (standard Swing/OS convention).
+     *
+     * @param tree the JTree to instrument
+     * @param onChange callback fired after a Remove / Keep-only action so the
+     *                 caller can recalculate folder sizes, regenerate the
+     *                 download/file list, refresh button states, etc. May be
+     *                 null if the caller doesn't need any post-mutation work.
+     */
+    public static void attachTreeContextMenu(final JTree tree, final Runnable onChange) {
+
+        final JPopupMenu menu = new JPopupMenu();
+
+        final JMenuItem remove_item = new JMenuItem(I18n.tr("ui.tree.context.remove"));
+        remove_item.addActionListener(e -> {
+            if (deleteSelectedTreeItems(tree) && onChange != null) {
+                onChange.run();
+            }
+        });
+
+        final JMenuItem keep_only_item = new JMenuItem(I18n.tr("ui.tree.context.keep_only"));
+        keep_only_item.addActionListener(e -> {
+            if (deleteAllExceptSelectedTreeItems(tree) && onChange != null) {
+                onChange.run();
+            }
+        });
+
+        menu.add(remove_item);
+        menu.add(keep_only_item);
+        menu.addSeparator();
+
+        final JMenuItem expand_all_item = new JMenuItem(I18n.tr("ui.tree.context.expand_all"));
+        expand_all_item.addActionListener(e -> {
+            for (int i = 0; i < tree.getRowCount(); i++) {
+                tree.expandRow(i);
+            }
+        });
+
+        final JMenuItem collapse_all_item = new JMenuItem(I18n.tr("ui.tree.context.collapse_all"));
+        collapse_all_item.addActionListener(e -> {
+            for (int i = tree.getRowCount() - 1; i >= 0; i--) {
+                tree.collapseRow(i);
+            }
+        });
+
+        menu.add(expand_all_item);
+        menu.add(collapse_all_item);
+
+        tree.addMouseListener(new java.awt.event.MouseAdapter() {
+
+            @Override
+            public void mousePressed(java.awt.event.MouseEvent e) {
+                maybeShow(e);
+            }
+
+            @Override
+            public void mouseReleased(java.awt.event.MouseEvent e) {
+                maybeShow(e);
+            }
+
+            private void maybeShow(java.awt.event.MouseEvent e) {
+                if (!e.isPopupTrigger() || !tree.isEnabled()) {
+                    return;
+                }
+
+                final TreePath row_path = tree.getPathForLocation(e.getX(), e.getY());
+
+                // If the user right-clicked on a node that isn't currently in
+                // the selection, replace the selection with that node so the
+                // action affects what was actually clicked. If the click landed
+                // on a node that *is* in the selection, leave the selection
+                // alone so multi-select still works (matches every other
+                // OS-native tree widget).
+                if (row_path != null && !tree.isPathSelected(row_path)) {
+                    tree.setSelectionPath(row_path);
+                }
+
+                final boolean has_selection = tree.getSelectionPaths() != null && tree.getSelectionPaths().length > 0;
+                remove_item.setEnabled(has_selection);
+                keep_only_item.setEnabled(has_selection);
+
+                menu.show(tree, e.getX(), e.getY());
+            }
+        });
+    }
+
     public static String truncateText(String text, int max_length) {
 
         String separator = " ... ";
@@ -1110,9 +1217,14 @@ public class MiscTools {
 
     public static String cleanFilename(String filename) {
 
+        // Collapse runs of 2+ dots to a single dot rather than replacing with
+        // "__": the old behaviour destroyed the extension on names like
+        // "1. Hello World..mp4" (-> "1. Hello World__mp4", no extension).
+        // After slash stripping there is no path-traversal risk from "..",
+        // and "." inside a filename is just a literal character.
         String cleaned = (IS_WINDOWS ? filename.replaceAll("[<>:\"/\\\\\\|\\?\\*\t]+", "") : filename)
                 .replaceAll("\\" + File.separator, "")
-                .replaceAll("\\.\\.+", "__")
+                .replaceAll("\\.{2,}", ".")
                 .replaceAll("[\\x00-\\x1F]", "")
                 .trim();
 
@@ -1146,7 +1258,10 @@ public class MiscTools {
 
     public static String cleanFilePath(String path) {
 
-        return !path.equals(".") ? ((IS_WINDOWS ? path.replaceAll("[<>:\"\\|\\?\\*\t]+", "") : path).replaceAll(" +\\" + File.separator, "\\" + File.separator).replaceAll("\\.\\.+", "__").replaceAll("[\\x00-\\x1F]", "").trim()) : path;
+        // See cleanFilename for the dot-collapse rationale. Slashes are kept
+        // here (this is a relative path), and collapsing "../foo" to "./foo"
+        // still resolves harmlessly inside the download base directory.
+        return !path.equals(".") ? ((IS_WINDOWS ? path.replaceAll("[<>:\"\\|\\?\\*\t]+", "") : path).replaceAll(" +\\" + File.separator, "\\" + File.separator).replaceAll("\\.{2,}", ".").replaceAll("[\\x00-\\x1F]", "").trim()) : path;
     }
 
     public static byte[] genRandomByteArray(int length) {
@@ -1278,11 +1393,23 @@ public class MiscTools {
 
             if (MainPanel.isUse_smart_proxy() && proxy_manager != null && proxy_manager.isForce_smart_proxy()) {
 
+                // getProxy() returns null when the pool is empty / every entry
+                // is banned or excluded. This block sits OUTSIDE the try below,
+                // so the old unconditional smart_proxy[0] threw an uncaught NPE
+                // straight into the caller (Download.getMegaFileDownloadUrl /
+                // the streamer) -- exactly in FORCE mode with a flaky pool,
+                // which is the #778 scenario. Null-guard + reset the excluded
+                // list so the next loop turn re-evaluates the full pool. (#778)
                 String[] smart_proxy = proxy_manager.getProxy(excluded_proxy_list);
 
-                current_smart_proxy = smart_proxy[0];
-
-                smart_proxy_protocol = smart_proxy[1];
+                if (smart_proxy != null) {
+                    current_smart_proxy = smart_proxy[0];
+                    smart_proxy_protocol = smart_proxy[1];
+                } else {
+                    LOG.log(Level.WARNING, "checkMegaDownloadUrl: SmartProxy force-mode exhausted -- checking direct");
+                    current_smart_proxy = null;
+                    excluded_proxy_list.clear();
+                }
 
                 while (current_smart_proxy != null
                         && ("ikev2".equals(smart_proxy_protocol) || "wireguard".equals(smart_proxy_protocol))
@@ -1311,17 +1438,25 @@ public class MiscTools {
 
                         String[] smart_proxy = proxy_manager.getProxy(excluded_proxy_list);
 
-                        current_smart_proxy = smart_proxy[0];
-
-                        smart_proxy_protocol = smart_proxy[1];
+                        if (smart_proxy != null) {
+                            current_smart_proxy = smart_proxy[0];
+                            smart_proxy_protocol = smart_proxy[1];
+                        } else {
+                            current_smart_proxy = null;
+                            excluded_proxy_list.clear();
+                        }
 
                     } else if (current_smart_proxy == null) {
 
                         String[] smart_proxy = proxy_manager.getProxy(excluded_proxy_list);
 
-                        current_smart_proxy = smart_proxy[0];
-
-                        smart_proxy_protocol = smart_proxy[1];
+                        if (smart_proxy != null) {
+                            current_smart_proxy = smart_proxy[0];
+                            smart_proxy_protocol = smart_proxy[1];
+                        } else {
+                            current_smart_proxy = null;
+                            excluded_proxy_list.clear();
+                        }
                     }
 
                     while (current_smart_proxy != null
@@ -1412,55 +1547,127 @@ public class MiscTools {
         return http_status != 403;
     }
 
+    /**
+     * Endpoints that return the caller's public IPv4 as plain text in the
+     * response body. Rotated through in order until one returns a valid IP. All
+     * HTTPS so a hostile network on the path can't spoof the response and
+     * mislead the 509-recovery logic into believing the IP changed (or didn't).
+     * The previous single source ("http://whatismyip.akamai.com/") was plain
+     * HTTP and a single point of failure -- if akamai's box was unreachable or
+     * an MITM rewrote the response, the IP-aware retry would mis-trigger.
+     * (#751)
+     */
+    private static final String[] PUBLIC_IP_SOURCES = new String[]{
+        "https://api.ipify.org/",
+        "https://ifconfig.me/ip",
+        "https://icanhazip.com/",
+        "https://ipv4.icanhazip.com/",
+        "https://checkip.amazonaws.com/"
+    };
+
+    // Tight timeouts: under worst case (all 5 sources hang to read-timeout)
+    // total wall time = 5 sources * (connect + read) = 5 * 4s = 20s. The
+    // MainPanel.getCachedPublicIp lock is held during this call so we want
+    // it bounded enough that contended workers don't pile up. Five sources
+    // is enough redundancy that a 2s read window covers any responsive endpoint.
+    private static final int PUBLIC_IP_CONNECT_TIMEOUT_MS = 2_000;
+    private static final int PUBLIC_IP_READ_TIMEOUT_MS = 2_000;
+
+    /**
+     * Bounded-validate the response body of one of the IPv4 services. They
+     * sometimes append a trailing newline or extra whitespace; trim and then
+     * verify dotted-quad shape. Reject anything that doesn't look like an IP so
+     * we don't poison the cache with HTML error pages.
+     */
+    private static String parsePublicIpResponse(String body) {
+        if (body == null) {
+            return null;
+        }
+        String trimmed = body.trim();
+        // Bound the input to avoid pathological regex on a giant body.
+        if (trimmed.length() > 64) {
+            return null;
+        }
+        if (trimmed.matches("\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}")) {
+            return trimmed;
+        }
+        return null;
+    }
+
     public static String getMyPublicIP() {
 
-        String public_ip = null;
-        HttpURLConnection con = null;
+        for (String source : PUBLIC_IP_SOURCES) {
+            HttpURLConnection con = null;
 
-        try {
+            try {
 
-            URL url_api = new URL("http://whatismyip.akamai.com/");
+                URL url_api = new URL(source);
 
-            if (MainPanel.isUse_proxy()) {
+                if (MainPanel.isUse_proxy()) {
 
-                con = (HttpURLConnection) url_api.openConnection(new Proxy(Proxy.Type.HTTP, new InetSocketAddress(MainPanel.getProxy_host(), MainPanel.getProxy_port())));
+                    con = (HttpURLConnection) url_api.openConnection(new Proxy(Proxy.Type.HTTP, new InetSocketAddress(MainPanel.getProxy_host(), MainPanel.getProxy_port())));
 
-                if (MainPanel.getProxy_user() != null && !"".equals(MainPanel.getProxy_user())) {
+                    if (MainPanel.getProxy_user() != null && !"".equals(MainPanel.getProxy_user())) {
 
-                    con.setRequestProperty("Proxy-Authorization", "Basic " + MiscTools.Bin2BASE64((MainPanel.getProxy_user() + ":" + MainPanel.getProxy_pass()).getBytes("UTF-8")));
-                }
-            } else {
+                        con.setRequestProperty("Proxy-Authorization", "Basic " + MiscTools.Bin2BASE64((MainPanel.getProxy_user() + ":" + MainPanel.getProxy_pass()).getBytes("UTF-8")));
+                    }
+                } else {
 
-                con = (HttpURLConnection) url_api.openConnection();
-            }
-
-            con.setUseCaches(false);
-
-            try (InputStream is = con.getInputStream(); ByteArrayOutputStream byte_res = new ByteArrayOutputStream()) {
-
-                byte[] buffer = new byte[MainPanel.DEFAULT_BYTE_BUFFER_SIZE];
-
-                int reads;
-
-                while ((reads = is.read(buffer)) != -1) {
-
-                    byte_res.write(buffer, 0, reads);
+                    con = (HttpURLConnection) url_api.openConnection();
                 }
 
-                public_ip = new String(byte_res.toByteArray(), "UTF-8");
-            }
+                con.setUseCaches(false);
+                con.setConnectTimeout(PUBLIC_IP_CONNECT_TIMEOUT_MS);
+                con.setReadTimeout(PUBLIC_IP_READ_TIMEOUT_MS);
+                con.setRequestProperty("User-Agent", MainPanel.DEFAULT_USER_AGENT);
 
-        } catch (MalformedURLException ex) {
-            Logger.getLogger(MiscTools.class.getName()).log(Level.SEVERE, ex.getMessage());
-        } catch (IOException ex) {
-            Logger.getLogger(MiscTools.class.getName()).log(Level.SEVERE, ex.getMessage());
-        } finally {
-            if (con != null) {
-                con.disconnect();
+                int status = con.getResponseCode();
+                if (status != 200) {
+                    Logger.getLogger(MiscTools.class.getName()).log(Level.FINE,
+                            "Public IP source {0} returned HTTP {1}", new Object[]{source, status});
+                    drainAndCloseErrorStream(con);
+                    continue;
+                }
+
+                String body;
+                try (InputStream is = con.getInputStream(); ByteArrayOutputStream byte_res = new ByteArrayOutputStream()) {
+
+                    byte[] buffer = new byte[MainPanel.DEFAULT_BYTE_BUFFER_SIZE];
+
+                    int reads;
+
+                    while ((reads = is.read(buffer)) != -1) {
+
+                        byte_res.write(buffer, 0, reads);
+                    }
+
+                    body = new String(byte_res.toByteArray(), "UTF-8");
+                }
+
+                String parsed = parsePublicIpResponse(body);
+                if (parsed != null) {
+                    return parsed;
+                }
+
+                Logger.getLogger(MiscTools.class.getName()).log(Level.FINE,
+                        "Public IP source {0} returned unparseable body (len={1})",
+                        new Object[]{source, body.length()});
+
+            } catch (MalformedURLException ex) {
+                Logger.getLogger(MiscTools.class.getName()).log(Level.SEVERE, ex.getMessage());
+            } catch (IOException ex) {
+                Logger.getLogger(MiscTools.class.getName()).log(Level.FINE,
+                        "Public IP source {0} failed: {1}", new Object[]{source, ex.getMessage()});
+            } finally {
+                if (con != null) {
+                    con.disconnect();
+                }
             }
         }
 
-        return public_ip;
+        Logger.getLogger(MiscTools.class.getName()).log(Level.WARNING,
+                "All {0} public IP sources failed", PUBLIC_IP_SOURCES.length);
+        return null;
     }
 
     public static String checkNewVersion(String url) {
@@ -1841,7 +2048,7 @@ public class MiscTools {
                 } catch (MegaAPIException exception) {
 
                     if (exception.getCode() == -6) {
-                        JOptionPane.showMessageDialog(container.getParent(), LabelTranslatorSingleton.getInstance().translate("You've tried to login too many times. Wait an hour."), "Error", JOptionPane.ERROR_MESSAGE);
+                        JOptionPane.showMessageDialog(container.getParent(), LabelTranslatorSingleton.getInstance().translate("You've tried to login too many times. Wait an hour."), I18n.tr("ui.error_title"), JOptionPane.ERROR_MESSAGE);
                     }
 
                     throw exception;

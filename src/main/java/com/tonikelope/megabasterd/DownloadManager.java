@@ -32,7 +32,24 @@ public class DownloadManager extends TransferenceManager {
         super(main_panel, main_panel.getMax_dl(), main_panel.getView().getStatus_down_label(), main_panel.getView().getjPanel_scroll_down(), main_panel.getView().getClose_all_finished_down_button(), main_panel.getView().getPause_all_down_button(), main_panel.getView().getClean_all_down_menu());
     }
 
-    public synchronized void forceResetAllChunks() {
+    /**
+     * #774 -- when the download queue transitions from non-empty to empty
+     * with at least one OK finish, dispatch the user's configured
+     * post-download-finish command. Fires independently of the upload-side
+     * variant and of the legacy 509 command; if all three converge they
+     * run concurrently. {@link MainPanel#run_dl_finish_command} no-ops when
+     * the feature is disabled, so no per-call gate is needed here.
+     */
+    @Override
+    protected void onAllTransferencesFinished() {
+        MainPanel.run_dl_finish_command();
+    }
+
+    public void forceResetAllChunks() {
+        // No synchronized: the actual work runs on THREAD_POOL, so the keyword
+        // only serialized the submission of the runnable -- not the work
+        // itself. Misleading. The per-worker RESET_CURRENT_CHUNK is the real
+        // boundary and is independently safe.
         THREAD_POOL.execute(() -> {
 
             ConcurrentLinkedQueue<Transference> transference_running_list = getMain_panel().getDownload_manager().getTransference_running_list();

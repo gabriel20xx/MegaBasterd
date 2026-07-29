@@ -11,7 +11,6 @@ package com.tonikelope.megabasterd;
 
 import static com.tonikelope.megabasterd.DBTools.*;
 import static com.tonikelope.megabasterd.MiscTools.*;
-import com.tonikelope.megabasterd.SmartMegaProxyManager.SmartProxyAuthenticator;
 import static com.tonikelope.megabasterd.Transference.*;
 import java.awt.AWTException;
 import java.awt.Color;
@@ -27,17 +26,16 @@ import java.awt.event.MouseEvent;
 import java.awt.event.WindowEvent;
 import static java.awt.event.WindowEvent.WINDOW_CLOSING;
 import java.io.File;
-import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.PrintStream;
 import static java.lang.Integer.parseInt;
 import static java.lang.System.exit;
-import java.net.Authenticator;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.sql.SQLException;
@@ -48,7 +46,6 @@ import java.util.Iterator;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
-import static java.util.concurrent.Executors.newCachedThreadPool;
 import java.util.logging.Level;
 import static java.util.logging.Level.SEVERE;
 import java.util.logging.Logger;
@@ -69,7 +66,7 @@ import javax.swing.UIManager;
  */
 public final class MainPanel {
 
-    public static final String VERSION = "8.27";
+    public static final String VERSION = "8.57";
     public static final boolean FORCE_SMART_PROXY = false; //TRUE FOR DEBUGING SMART PROXY
     public static final int THROTTLE_SLICE_SIZE = 16 * 1024;
     public static final int DEFAULT_BYTE_BUFFER_SIZE = 16 * 1024;
@@ -84,7 +81,54 @@ public final class MainPanel {
     public static final float ZOOM_FACTOR = 0.8f;
     public static final String DEFAULT_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64; rv:61.0) Gecko/20100101 Firefox/61.0";
     public static final String ICON_FILE = "/images/pica_roja_big.png";
-    public static final ExecutorService THREAD_POOL = newCachedThreadPool(_megabasterdDaemonThreadFactory());
+    /**
+     * Max worker threads in the global pool. The pool used to be
+     * {@code newCachedThreadPool()} (unbounded) which under heavy bursts
+     * (several transferences provisioning + smart-proxy refresh + per-slot
+     * managers + streamer + tray watchdog) routinely peaked at 100-200 live
+     * threads. Each thread carries a ~512 KB-1 MB native stack, so that
+     * burst alone added 50-200 MB of RSS that no GC can reclaim -- the
+     * memory growth that #773 complained about.
+     *
+     * 64 leaves ample headroom for the worst real-world burst observed (a
+     * handful of managers + supervisors + ~30 per-transfer workers; the
+     * per-Download chunk workers live in each Download's *own* thread pool,
+     * not in this one). Tasks submitted past the active cap queue up on the
+     * unbounded LinkedBlockingQueue and start within microseconds as soon
+     * as a worker frees up. No work is dropped. (#773)
+     *
+     * NOTE -- 8.53 first wired this as {@code ThreadPoolExecutor(0, 64,
+     * LinkedBlockingQueue)}, which silently froze every task after the
+     * first one. The textbook trap: with corePoolSize=0 and an unbounded
+     * queue, {@link java.util.concurrent.ThreadPoolExecutor#execute}
+     * always prefers queuing over creating a new worker once any worker
+     * exists, AND it only spawns a recovery worker after queuing when
+     * {@code workerCountOf == 0}. So the first task (the
+     * {@code while (!_exit)} memory monitor below) grabs the lone worker
+     * forever, every later submit (including resumeDownloads /
+     * resumeUploads / smart-proxy refresh / watchdog accept loop /
+     * megacrypter reverse) enqueues and never runs -- hence the
+     * "Checking previous downloads..." indicator that stayed forever in
+     * #776, even on a clean install with an empty queue. Fix: pre-size
+     * corePoolSize == maxPoolSize and turn on
+     * {@code allowCoreThreadTimeOut} so the pool grows up to 64 workers
+     * on demand and still lets idle workers die after keepAlive. (#776)
+     */
+    public static final int GLOBAL_THREAD_POOL_MAX = 64;
+    public static final ExecutorService THREAD_POOL;
+
+    static {
+        java.util.concurrent.ThreadPoolExecutor tpe = new java.util.concurrent.ThreadPoolExecutor(
+                GLOBAL_THREAD_POOL_MAX, GLOBAL_THREAD_POOL_MAX,
+                60L, java.util.concurrent.TimeUnit.SECONDS,
+                new java.util.concurrent.LinkedBlockingQueue<>(),
+                _megabasterdDaemonThreadFactory());
+        // Without this, core threads stay alive forever -- which means once
+        // the pool has grown under a burst it stays at that RSS cost even
+        // when idle, defeating the #773 memory-bound goal.
+        tpe.allowCoreThreadTimeOut(true);
+        THREAD_POOL = tpe;
+    }
 
     private static java.util.concurrent.ThreadFactory _megabasterdDaemonThreadFactory() {
         return new java.util.concurrent.ThreadFactory() {
@@ -104,21 +148,132 @@ public final class MainPanel {
         };
     }
     public static volatile String MEGABASTERD_HOME_DIR = System.getProperty("user.home");
-    private static String _proxy_host;
-    private static int _proxy_port;
-    private static boolean _use_proxy;
-    private static String _proxy_user;
-    private static String _proxy_pass;
-    private static boolean _use_smart_proxy;
-    private static boolean _run_command;
-    private static String _run_command_path;
+    // Proxy-routing config + the SmartProxy manager handle are read by
+    // long-lived worker threads (ChunkDownloader / ChunkDownloaderMono /
+    // MegaAPI.RAW_REQUEST) that may have been started BEFORE the user toggles
+    // any of these in Settings at runtime. They are written on the EDT
+    // (loadUserSettings / setProxy_manager). Without `volatile` there is NO
+    // happens-before edge between the EDT write and an already-running
+    // worker's read, so the worker can (a) keep observing the stale cached
+    // value forever or (b) have the JIT hoist the read out of its hot loop.
+    // That is the root cause of #778: enabling SmartProxy at runtime never
+    // resumed downloads (the workers kept reading _use_smart_proxy==false /
+    // _proxy_manager==null and never entered the proxy-routing branch), while
+    // a restart with SmartProxy pre-enabled worked because the workers were
+    // then created AFTER the writes (Thread.start() = happens-before). Affects
+    // EVERY proxy type, not just authenticated ones. (#778)
+    private static volatile String _proxy_host;
+    private static volatile int _proxy_port;
+    private static volatile boolean _use_proxy;
+    private static volatile String _proxy_user;
+    private static volatile String _proxy_pass;
+    private static volatile boolean _use_smart_proxy;
+    // volatile: same #778-class race as the proxy fields. _run_command is read
+    // in the ChunkDownloader / ChunkDownloaderMono hot loop on every 509
+    // (MainPanel.isRun_command()) and the *_path / *_finish fields are read by
+    // the TransferenceManager status loop, all on worker/background threads
+    // that may predate the EDT write in loadUserSettings(). Without volatile an
+    // already-running worker may never observe a runtime enable of the
+    // post-quota / post-finish command. (#778)
+    private static volatile boolean _run_command;
+    private static volatile String _run_command_path;
+    // #774 -- two independent post-finish commands, one per queue. Settings
+    // and triggers are fully independent of the legacy "MEGA download limit
+    // reached" command above and of each other; if downloads and uploads
+    // both empty at the same time both commands fire concurrently.
+    private static volatile boolean _run_command_dl_finish;
+    private static volatile String _run_command_dl_finish_path;
+    private static volatile boolean _run_command_ul_finish;
+    private static volatile String _run_command_ul_finish_path;
     private static String _font;
-    private static SmartMegaProxyManager _proxy_manager;
+    // volatile: see the proxy-config block above -- read by already-running
+    // worker threads, written on the EDT at runtime-enable. (#778)
+    private static volatile SmartMegaProxyManager _proxy_manager;
     private static volatile String _language;
     private static String _new_version;
     private static Boolean _resume_uploads;
     private static Boolean _resume_downloads;
     public static volatile long LAST_EXTERNAL_COMMAND_TIMESTAMP;
+    // #774 -- separate cooldown timestamps so neither command can starve the
+    // others. Each post-finish command has its own RUN_COMMAND_TIME-style
+    // guard; in practice the natural "queue must transition from non-empty
+    // to empty" gate prevents accidental refire much earlier than the
+    // timestamp would, but we keep the same belt-and-braces pattern as
+    // run_external_command() to stay consistent.
+    public static volatile long LAST_DL_FINISH_COMMAND_TIMESTAMP;
+    public static volatile long LAST_UL_FINISH_COMMAND_TIMESTAMP;
+
+    /**
+     * Shared cached public IP for the 509-recovery / VPN-aware retry path.
+     * Workers call getCachedPublicIp() during 509 backoff to notice that the
+     * user changed their public IP (e.g. activated a VPN). Without a cache, N
+     * parallel workers all hitting the public-IP services every backoff slice
+     * would (a) burn budget on those services and (b) potentially desync
+     * because each worker would get a fresh fetch with its own timing. One
+     * cache, one fetcher at a time, TTL 30 s. (#751)
+     */
+    private static volatile String _cached_public_ip = null;
+    private static volatile long _cached_public_ip_ts = 0L;
+    private static final java.util.concurrent.locks.ReentrantLock _public_ip_lock = new java.util.concurrent.locks.ReentrantLock();
+    private static final long PUBLIC_IP_CACHE_TTL_MS = 30_000L;
+
+    /**
+     * Returns the most recent public IPv4 we've seen, refreshing via
+     * MiscTools.getMyPublicIP() (which rotates HTTPS sources) at most once per
+     * {@link #PUBLIC_IP_CACHE_TTL_MS}. Returns null if no fetch has ever
+     * succeeded; otherwise returns the previously-cached value when the current
+     * fetch attempt fails (treating it as "no IP change detected" rather than
+     * poisoning callers with null). Safe to call concurrently from any worker
+     * thread. (#751)
+     */
+    public static String getCachedPublicIp() {
+        long now = System.currentTimeMillis();
+        if (_cached_public_ip != null && now - _cached_public_ip_ts < PUBLIC_IP_CACHE_TTL_MS) {
+            return _cached_public_ip;
+        }
+        // tryLock instead of synchronized: under heavy 509 backoff multiple
+        // workers will all hit this path nearly simultaneously. The first
+        // one performs the (potentially-slow) HTTPS fetch; the rest must
+        // NOT block waiting on its lock -- they should just return the
+        // previous cached value and move on. Otherwise N workers can pile
+        // up behind a single 20 s fetch and stall the download. (#751)
+        if (_public_ip_lock.tryLock()) {
+            try {
+                now = System.currentTimeMillis();
+                if (_cached_public_ip != null && now - _cached_public_ip_ts < PUBLIC_IP_CACHE_TTL_MS) {
+                    return _cached_public_ip;
+                }
+                String fresh = MiscTools.getMyPublicIP();
+                if (fresh != null) {
+                    _cached_public_ip = fresh;
+                }
+                // Always advance the timestamp -- otherwise consecutive
+                // failed fetches would hammer the IP services on every
+                // backoff slice.
+                _cached_public_ip_ts = System.currentTimeMillis();
+                return _cached_public_ip;
+            } finally {
+                _public_ip_lock.unlock();
+            }
+        }
+        // Could not grab the lock: another thread is mid-fetch. Don't wait,
+        // just return whatever we have cached (may be stale or null). The
+        // IP-change detector in ChunkDownloader is conservative and only
+        // breaks the backoff when it sees a CHANGE -- a stale read just
+        // means "no change detected this tick", which is a safe default.
+        return _cached_public_ip;
+    }
+
+    /**
+     * Force-invalidate the public-IP cache so the next getCachedPublicIp() call
+     * will trigger a fresh fetch. Used by the 509 path after running the user's
+     * external command (which may have switched VPN), so we don't keep
+     * returning the pre-VPN IP and miss the change. (#751)
+     */
+    public static void invalidatePublicIpCache() {
+        _cached_public_ip_ts = 0L;
+    }
+
     private static final Logger LOG = Logger.getLogger(MainPanel.class.getName());
     private static volatile boolean CHECK_RUNNING = true;
 
@@ -162,6 +317,19 @@ public final class MainPanel {
             MiscTools.createUploadLogDir();
         }
 
+        // Issue #771: first-run language autodetection. Must run BEFORE the
+        // v8.27 migration below, which writes verify_down_file_migrated_v827
+        // and makes the settings table non-empty. We only autodetect on a true
+        // fresh install (no settings rows at all); existing users who never
+        // picked a language keep getting EN to avoid a surprise UI switch.
+        try {
+            if (DBTools.isSettingsTableEmpty()) {
+                DBTools.insertSettingValue("language", detectOsLanguage());
+            }
+        } catch (SQLException ex) {
+            Logger.getLogger(MainPanel.class.getName()).log(SEVERE, "first-run language autodetect failed", ex);
+        }
+
         // 8.27 migration: users who upgraded from pre-afb3936 builds (when
         // VERIFY_CBC_MAC_DEFAULT was false) have "verify_down_file" = "no"
         // persisted in their settings DB from any time they opened Settings
@@ -196,6 +364,23 @@ public final class MainPanel {
         return _run_command_path;
     }
 
+    // #774 -- accessors for the two post-finish commands.
+    public static boolean isRun_command_dl_finish() {
+        return _run_command_dl_finish;
+    }
+
+    public static String getRun_command_dl_finish_path() {
+        return _run_command_dl_finish_path;
+    }
+
+    public static boolean isRun_command_ul_finish() {
+        return _run_command_ul_finish;
+    }
+
+    public static String getRun_command_ul_finish_path() {
+        return _run_command_ul_finish_path;
+    }
+
     public static String getFont() {
         return _font;
     }
@@ -206,6 +391,36 @@ public final class MainPanel {
 
     public static String getLanguage() {
         return _language;
+    }
+
+    // Issue #771: first-run autodetection. Map the JVM default locale's
+    // ISO 639-1 code to MegaBasterd's internal language codes; fall back to
+    // EN when the OS language has no bundled translation.
+    public static String detectOsLanguage() {
+        String iso = java.util.Locale.getDefault().getLanguage();
+        if (iso == null) {
+            return DEFAULT_LANGUAGE;
+        }
+        switch (iso.toLowerCase(java.util.Locale.ROOT)) {
+            case "es":
+                return "ES";
+            case "it":
+                return "IT";
+            case "tr":
+                return "TU";
+            case "zh":
+                return "CH";
+            case "vi":
+                return "VI";
+            case "de":
+                return "GE";
+            case "hu":
+                return "HU";
+            case "en":
+                return "EN";
+            default:
+                return DEFAULT_LANGUAGE;
+        }
     }
 
     public static String getProxy_user() {
@@ -274,6 +489,9 @@ public final class MainPanel {
         _exit = false;
 
         LAST_EXTERNAL_COMMAND_TIMESTAMP = -1;
+        // #774
+        LAST_DL_FINISH_COMMAND_TIMESTAMP = -1;
+        LAST_UL_FINISH_COMMAND_TIMESTAMP = -1;
 
         _restart = false;
 
@@ -300,6 +518,13 @@ public final class MainPanel {
         _resume_uploads = false;
 
         _resume_downloads = false;
+
+        // Capture java.util.logging records into an in-memory queue so the
+        // "DEBUG LOG" tab built below (after the view is up) can show them.
+        // Done BEFORE loadUserSettings so early init records are not lost.
+        // We do NOT touch System.out / System.err and we do NOT raise the
+        // root level -- the existing filter still applies. (#751 / D)
+        DebugLogBus.installJULHandler();
 
         loadUserSettings();
 
@@ -345,7 +570,7 @@ public final class MainPanel {
             }
         }
 
-        System.out.println(System.getProperty("os.name") + "" + System.getProperty("java.vm.name") + " " + System.getProperty("java.version") + " " + System.getProperty("java.home"));
+        LOG.log(Level.INFO, "Runtime: {0} {1} {2} {3}", new Object[]{System.getProperty("os.name"), System.getProperty("java.vm.name"), System.getProperty("java.version"), System.getProperty("java.home")});
 
         UIManager.put("OptionPane.messageFont", GUI_FONT.deriveFont(15f * getZoom_factor()));
 
@@ -358,6 +583,105 @@ public final class MainPanel {
         UIManager.put("OptionPane.okButtonText", LabelTranslatorSingleton.getInstance().translate("OK"));
 
         _view = new MainPanelView(this);
+
+        // (Removed in #757) The Edit menu used to have a "Quota recovery &
+        // SmartProxy (509)" shortcut that opened a standalone dialog
+        // (QuotaRecoverySettingsDialog). Those settings now live as the
+        // "Quota / 509" tab in the main Settings dialog, reached via the
+        // regular Edit > Settings menu. The shortcut was removed -- besides
+        // being redundant, it bypassed the account-deletion cleanup that
+        // MainPanelView.settings_menuActionPerformed runs after the dialog
+        // closes, which would have left _main_panel.getMega_accounts() out
+        // of sync if the user touched the Accounts tab via the shortcut.
+
+        // "DEBUG LOG" tab. Everything inside GUIRunAndWait so it runs on the
+        // EDT; addTab on a JTabbedPane after the view is realised has to be
+        // EDT-safe. DebugLogBus.installJULHandler() ran above, so the queue
+        // has been buffering since startup -- bind() will start a Timer that
+        // drains the queue into the textarea every 300 ms, batched. (#751 / D)
+        MiscTools.GUIRunAndWait(() -> {
+            try {
+                javax.swing.JTextArea debug_area = new javax.swing.JTextArea();
+                debug_area.setEditable(false);
+                debug_area.setLineWrap(false);
+                debug_area.setBackground(new java.awt.Color(30, 30, 30));
+                debug_area.setForeground(new java.awt.Color(220, 220, 220));
+                debug_area.setCaretColor(new java.awt.Color(220, 220, 220));
+                debug_area.setSelectionColor(new java.awt.Color(70, 90, 130));
+                debug_area.setFont(new java.awt.Font(java.awt.Font.MONOSPACED, java.awt.Font.PLAIN, 12));
+
+                javax.swing.JScrollPane debug_scroll = new javax.swing.JScrollPane(debug_area);
+                debug_scroll.getViewport().setBackground(new java.awt.Color(30, 30, 30));
+
+                javax.swing.JButton clear_btn = new javax.swing.JButton(I18n.tr("ui.debuglog.clear_button"));
+                clear_btn.setToolTipText(I18n.tr("ui.tooltip.clear_debug_log"));
+                clear_btn.addActionListener((evt) -> {
+                    int ans = javax.swing.JOptionPane.showConfirmDialog(_view,
+                            I18n.tr("ui.confirm.clear_debug_log.message"),
+                            I18n.tr("ui.confirm.clear_debug_log.title"), javax.swing.JOptionPane.YES_NO_OPTION,
+                            javax.swing.JOptionPane.WARNING_MESSAGE);
+                    if (ans == javax.swing.JOptionPane.YES_OPTION) {
+                        debug_area.setText("");
+                    }
+                });
+
+                javax.swing.JButton copy_btn = new javax.swing.JButton(I18n.tr("ui.debuglog.copy_button"));
+                copy_btn.setToolTipText(I18n.tr("ui.tooltip.copy_debug_log"));
+                copy_btn.addActionListener((evt) -> {
+                    try {
+                        java.awt.Toolkit.getDefaultToolkit().getSystemClipboard()
+                                .setContents(new java.awt.datatransfer.StringSelection(debug_area.getText()), null);
+                    } catch (Exception ignore) {
+                    }
+                });
+
+                javax.swing.JButton save_btn = new javax.swing.JButton(I18n.tr("ui.debuglog.save_button"));
+                save_btn.setToolTipText(I18n.tr("ui.tooltip.save_debug_log"));
+                save_btn.addActionListener((evt) -> {
+                    javax.swing.JFileChooser chooser = new javax.swing.JFileChooser();
+                    chooser.setDialogTitle(I18n.tr("ui.debuglog.save_dialog_title"));
+                    String stamp = new java.text.SimpleDateFormat("yyyyMMdd_HHmmss").format(new java.util.Date());
+                    chooser.setSelectedFile(new java.io.File("megabasterd_debug_" + stamp + ".log"));
+                    if (chooser.showSaveDialog(_view) == javax.swing.JFileChooser.APPROVE_OPTION) {
+                        java.io.File target = chooser.getSelectedFile();
+                        try (java.io.OutputStreamWriter w = new java.io.OutputStreamWriter(
+                                new java.io.FileOutputStream(target), java.nio.charset.StandardCharsets.UTF_8)) {
+                            w.write(debug_area.getText());
+                        } catch (Exception ex) {
+                            javax.swing.JOptionPane.showMessageDialog(_view,
+                                    I18n.tr("ui.err.save_log.message", ex.getMessage()),
+                                    I18n.tr("ui.err.save_log.title"), javax.swing.JOptionPane.ERROR_MESSAGE);
+                        }
+                    }
+                });
+
+                javax.swing.JPanel toolbar = new javax.swing.JPanel(
+                        new java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 6, 4));
+                toolbar.add(save_btn);
+                toolbar.add(copy_btn);
+                toolbar.add(clear_btn);
+
+                javax.swing.JPanel debug_panel = new javax.swing.JPanel(new java.awt.BorderLayout());
+                debug_panel.add(toolbar, java.awt.BorderLayout.NORTH);
+                debug_panel.add(debug_scroll, java.awt.BorderLayout.CENTER);
+
+                _view.getjTabbedPane1().addTab(I18n.tr("ui.tab.debug_log"),
+                        new javax.swing.ImageIcon(getClass().getResource("/images/icons8-services-30.png")),
+                        debug_panel);
+
+                // Deliberately NOT calling MiscTools.updateFonts on the
+                // textarea: the recursive font derive would replace the
+                // monospaced 12pt with a proportional family scaled by
+                // zoom_factor, which makes stack traces unreadable. The
+                // toolbar buttons use the platform default which is good
+                // enough.
+
+                DebugLogBus.bind(debug_area);
+            } catch (Exception ex) {
+                Logger.getLogger(MainPanel.class.getName()).log(Level.WARNING,
+                        "Could not wire DEBUG LOG tab: {0}", ex.getMessage());
+            }
+        });
 
         if (CHECK_RUNNING && checkAppIsRunning()) {
 
@@ -416,17 +740,13 @@ public final class MainPanel {
             MainPanel tthis = this;
 
             THREAD_POOL.execute(() -> {
-                Authenticator.setDefault(new SmartProxyAuthenticator());
-
-                String lista_proxy = DBTools.selectSettingValue("custom_proxy_list");
-
-                if (lista_proxy == null) {
-                    lista_proxy = "";
-                }
-
-                String url_list = MiscTools.findFirstRegex("^#(http.+)$", lista_proxy.trim(), 1);
-
-                _proxy_manager = new SmartMegaProxyManager(url_list, tthis);
+                // #URL extraction is now done inside SmartMegaProxyManager
+                // itself so multiple sources can be aggregated. (#753)
+                // Authenticator.setDefault() now happens inside the
+                // SmartMegaProxyManager constructor so the startup path and the
+                // runtime-enable path (MainPanelView) install it identically.
+                // (#778)
+                _proxy_manager = new SmartMegaProxyManager(tthis);
             });
 
         } else {
@@ -441,19 +761,53 @@ public final class MainPanel {
             getView().getGlobal_speed_up_label().setForeground(_limit_upload_speed ? new Color(255, 0, 0) : new Color(0, 128, 255));
         });
 
+        // Auto-GC hint cooldown for the memory monitor below. Wakes the JVM
+        // to reclaim heap when usage crosses
+        // FORCE_GARBAGE_COLLECTION_MAX_MEMORY_PERCENT of -Xmx but at most
+        // once per AUTO_GC_COOLDOWN_MS, so we don't pin a core stop-the-world
+        // GCing every 2 s during heavy chunk decryption. (#773)
+        final long AUTO_GC_COOLDOWN_MS = 60_000L;
+        // Make the RAM label a manual "release unused JVM RAM" trigger -- the
+        // best the JVM exposes is System.gc() (a hint, not a directive), but
+        // on G1/ZGC it does prompt heap shrink + return-to-OS. (#773)
+        MiscTools.GUIRun(() -> {
+            JLabel ml = _view.getMemory_status();
+            ml.setCursor(java.awt.Cursor.getPredefinedCursor(java.awt.Cursor.HAND_CURSOR));
+            ml.setToolTipText(I18n.tr("ui.statusbar.jvm_ram.tooltip"));
+            ml.addMouseListener(new MouseAdapter() {
+                @Override
+                public void mouseClicked(MouseEvent e) {
+                    System.gc();
+                }
+            });
+        });
+
         THREAD_POOL.execute(() -> {
             Runtime instance = Runtime.getRuntime();
             String last_text = null;
+            long last_auto_gc_ms = 0L;
             while (!_exit) {
                 long used_memory = instance.totalMemory() - instance.freeMemory();
                 long max_memory = instance.maxMemory();
-                String text = "JVM-RAM used: " + MiscTools.formatBytes(used_memory) + " / " + MiscTools.formatBytes(max_memory);
+                String text = I18n.tr("ui.statusbar.jvm_ram", MiscTools.formatBytes(used_memory), MiscTools.formatBytes(max_memory));
                 // Skip setText if the rendered string is unchanged -- the EDT
                 // doesn't need a repaint event for "same value".
                 if (!text.equals(last_text)) {
                     last_text = text;
                     final String t = text;
                     MiscTools.GUIRun(() -> _view.getMemory_status().setText(t));
+                }
+                // (#773) Hint the JVM to GC when usage crosses the threshold.
+                // System.gc() is advisory but the default G1 collector does
+                // honour it and will, after a couple of cycles, return free
+                // regions to the OS -- which is the user-visible reduction
+                // people complain about. Cooldown prevents thrashing.
+                long now = System.currentTimeMillis();
+                if (max_memory > 0
+                        && (double) used_memory / (double) max_memory > FORCE_GARBAGE_COLLECTION_MAX_MEMORY_PERCENT
+                        && now - last_auto_gc_ms > AUTO_GC_COOLDOWN_MS) {
+                    last_auto_gc_ms = now;
+                    System.gc();
                 }
                 try {
                     Thread.sleep(2000);
@@ -884,6 +1238,30 @@ public final class MainPanel {
             LAST_EXTERNAL_COMMAND_TIMESTAMP = -1;
         }
 
+        // #774 -- two independent post-queue-finish commands. Same pattern
+        // as the 509 command above: yes/no flag + path. Path-change wipes
+        // the per-command cooldown timestamp so the user can test the new
+        // command right away.
+        String run_command_dl_finish_string = DBTools.selectSettingValue("run_command_dl_finish");
+        if (run_command_dl_finish_string != null) {
+            _run_command_dl_finish = run_command_dl_finish_string.equals("yes");
+        }
+        String old_run_command_dl_finish_path = _run_command_dl_finish_path;
+        _run_command_dl_finish_path = DBTools.selectSettingValue("run_command_dl_finish_path");
+        if (_run_command_dl_finish && old_run_command_dl_finish_path != null && !old_run_command_dl_finish_path.equals(_run_command_dl_finish_path)) {
+            LAST_DL_FINISH_COMMAND_TIMESTAMP = -1;
+        }
+
+        String run_command_ul_finish_string = DBTools.selectSettingValue("run_command_ul_finish");
+        if (run_command_ul_finish_string != null) {
+            _run_command_ul_finish = run_command_ul_finish_string.equals("yes");
+        }
+        String old_run_command_ul_finish_path = _run_command_ul_finish_path;
+        _run_command_ul_finish_path = DBTools.selectSettingValue("run_command_ul_finish_path");
+        if (_run_command_ul_finish && old_run_command_ul_finish_path != null && !old_run_command_ul_finish_path.equals(_run_command_ul_finish_path)) {
+            LAST_UL_FINISH_COMMAND_TIMESTAMP = -1;
+        }
+
         String use_megacrypter_reverse = selectSettingValue("megacrypter_reverse");
 
         if (use_megacrypter_reverse != null) {
@@ -913,6 +1291,17 @@ public final class MainPanel {
             _language = DEFAULT_LANGUAGE;
         }
 
+        // External language file override (#766). Translators can point this at
+        // a UTF-8 .properties file on disk to test their translation without
+        // rebuilding the JAR; entries take precedence over the embedded bundle.
+        String external_language_file = DBTools.selectSettingValue("external_language_file");
+
+        if (external_language_file != null && !external_language_file.trim().isEmpty()) {
+            I18n.setExternalLanguageFile(Paths.get(external_language_file.trim()));
+        } else {
+            I18n.setExternalLanguageFile(null);
+        }
+
         String debug_file = selectSettingValue("debug_file");
 
         if (debug_file != null) {
@@ -938,28 +1327,68 @@ public final class MainPanel {
         if (_run_command && (LAST_EXTERNAL_COMMAND_TIMESTAMP == -1 || LAST_EXTERNAL_COMMAND_TIMESTAMP + RUN_COMMAND_TIME * 1000 < System.currentTimeMillis())) {
 
             if (_run_command_path != null && !_run_command_path.equals("")) {
-                try {
-                    String cmd = _run_command_path;
-                    java.io.File f = new java.io.File(cmd);
-                    java.util.List<String> argv;
-                    if (f.exists()) {
-                        // Treat the whole setting as a single binary path; this
-                        // makes "C:\Program Files\foo\bar.exe" work without the
-                        // old whitespace-split bug. If you need args, wrap in a
-                        // .bat/.sh script.
-                        argv = java.util.Collections.singletonList(cmd);
-                    } else {
-                        // Backwards-compat: command isn't a real file, fall back
-                        // to legacy whitespace-token splitting so existing
-                        // "command arg1 arg2" configs keep working.
-                        argv = java.util.Arrays.asList(cmd.trim().split("\\s+"));
-                    }
-                    new ProcessBuilder(argv).inheritIO().start();
-                } catch (IOException ex) {
-                    Logger.getLogger(MainPanel.class.getName()).log(Level.SEVERE, ex.getMessage());
-                }
-
+                _spawnExternalProcess(_run_command_path);
                 LAST_EXTERNAL_COMMAND_TIMESTAMP = System.currentTimeMillis();
+            }
+        }
+    }
+
+    /**
+     * Shared spawn helper for the three external-command paths
+     * ({@link #run_external_command}, {@link #run_dl_finish_command},
+     * {@link #run_ul_finish_command}). Mirrors the old inline behaviour
+     * exactly: if the configured value is a real file, treat it as a
+     * single argv[0]; otherwise fall back to legacy whitespace-token
+     * splitting so existing "command arg1 arg2" configs keep working.
+     * Output inherits stdout/stderr; failures are logged and swallowed
+     * so the trigger path is never disturbed. (#774 -- factored out so
+     * the three call-sites stay in lockstep.)
+     */
+    private static void _spawnExternalProcess(String configured_cmd) {
+        try {
+            String cmd = configured_cmd;
+            java.io.File f = new java.io.File(cmd);
+            java.util.List<String> argv;
+            if (f.exists()) {
+                argv = java.util.Collections.singletonList(cmd);
+            } else {
+                argv = java.util.Arrays.asList(cmd.trim().split("\\s+"));
+            }
+            new ProcessBuilder(argv).inheritIO().start();
+        } catch (IOException ex) {
+            Logger.getLogger(MainPanel.class.getName()).log(Level.SEVERE, ex.getMessage());
+        }
+    }
+
+    /**
+     * #774 -- fires the user's "downloads queue finished" command. Cooldown
+     * is independent of the 509 command and of the upload-finish command;
+     * if all three trigger simultaneously, all three run concurrently. The
+     * natural "queue must transition from non-empty to empty" gate in
+     * {@link TransferenceManager} already prevents accidental refire on
+     * the same finished batch, but we keep the RUN_COMMAND_TIME timestamp
+     * guard for defence-in-depth.
+     */
+    public static synchronized void run_dl_finish_command() {
+        if (_run_command_dl_finish && (LAST_DL_FINISH_COMMAND_TIMESTAMP == -1 || LAST_DL_FINISH_COMMAND_TIMESTAMP + RUN_COMMAND_TIME * 1000 < System.currentTimeMillis())) {
+            if (_run_command_dl_finish_path != null && !_run_command_dl_finish_path.equals("")) {
+                _spawnExternalProcess(_run_command_dl_finish_path);
+                LAST_DL_FINISH_COMMAND_TIMESTAMP = System.currentTimeMillis();
+            }
+        }
+    }
+
+    /**
+     * #774 -- fires the user's "uploads queue finished" command. See
+     * {@link #run_dl_finish_command} for the cooldown / concurrency
+     * semantics; the upload-side variant follows the exact same pattern
+     * with its own state and is wired from {@link UploadManager}.
+     */
+    public static synchronized void run_ul_finish_command() {
+        if (_run_command_ul_finish && (LAST_UL_FINISH_COMMAND_TIMESTAMP == -1 || LAST_UL_FINISH_COMMAND_TIMESTAMP + RUN_COMMAND_TIME * 1000 < System.currentTimeMillis())) {
+            if (_run_command_ul_finish_path != null && !_run_command_ul_finish_path.equals("")) {
+                _spawnExternalProcess(_run_command_ul_finish_path);
+                LAST_UL_FINISH_COMMAND_TIMESTAMP = System.currentTimeMillis();
             }
         }
     }
@@ -1155,14 +1584,50 @@ public final class MainPanel {
                         LabelTranslatorSingleton.getInstance().translate("Yes")};
 
                     int n = showOptionDialog(getView(),
-                            LabelTranslatorSingleton.getInstance().translate("An older version (" + old_version + ") of MegaBasterd has been detected.\nDo you want to import all current settings and transfers from the previous version?\nWARNING: INCOMPATIBILITIES MAY EXIST BETWEEN VERSIONS."),
+                            I18n.tr("older_version_import_prompt", old_version),
                             LabelTranslatorSingleton.getInstance().translate("Warning!"), YES_NO_CANCEL_OPTION, JOptionPane.INFORMATION_MESSAGE,
                             null,
                             options,
                             options[0]);
 
                     if (n == 1) {
-                        Files.copy(Paths.get(MainPanel.MEGABASTERD_HOME_DIR + "/.megabasterd_old_backups/.megabasterd" + old_version + "/" + SqliteSingleton.SQLITE_FILE), Paths.get(MainPanel.MEGABASTERD_HOME_DIR + "/.megabasterd" + MainPanel.VERSION + "/" + SqliteSingleton.SQLITE_FILE), StandardCopyOption.REPLACE_EXISTING);
+                        // The MB boot path has already opened the new (empty)
+                        // megabasterd.db dozens of times via DBTools, so a WAL
+                        // and -shm sidecar exist next to it. Naively copying
+                        // just the .db file leaves those sidecars in place,
+                        // and on next boot SQLite may replay the empty-DB WAL
+                        // on top of the imported DB and silently discard the
+                        // import. Worse, on Windows the open connection can
+                        // also block the REPLACE_EXISTING copy itself, and
+                        // the resulting IOException used to be swallowed
+                        // without telling the user.
+                        Path source_db = Paths.get(MainPanel.MEGABASTERD_HOME_DIR + "/.megabasterd_old_backups/.megabasterd" + old_version + "/" + SqliteSingleton.SQLITE_FILE);
+                        Path new_dir = Paths.get(MainPanel.MEGABASTERD_HOME_DIR + "/.megabasterd" + MainPanel.VERSION);
+                        Path target_db = new_dir.resolve(SqliteSingleton.SQLITE_FILE);
+                        Path target_wal = new_dir.resolve(SqliteSingleton.SQLITE_FILE + "-wal");
+                        Path target_shm = new_dir.resolve(SqliteSingleton.SQLITE_FILE + "-shm");
+
+                        try {
+                            // Checkpoint + close the open connection to the
+                            // empty DB so the file is unlocked (Windows) and
+                            // the WAL has nothing live in it.
+                            SqliteSingleton.getInstance().shutdown();
+
+                            // Belt-and-braces: drop the now-orphaned WAL/-shm
+                            // so SQLite cannot try to replay them on the
+                            // imported DB at next boot.
+                            Files.deleteIfExists(target_wal);
+                            Files.deleteIfExists(target_shm);
+
+                            Files.copy(source_db, target_db, StandardCopyOption.REPLACE_EXISTING);
+
+                        } catch (IOException copy_ex) {
+                            Logger.getLogger(MainPanel.class.getName()).log(Level.SEVERE, "Settings import failed: {0}", copy_ex.getMessage());
+                            JOptionPane.showMessageDialog(getView(),
+                                    LabelTranslatorSingleton.getInstance().translate("Could not import the previous-version settings.") + "\n\n" + copy_ex.getMessage(),
+                                    LabelTranslatorSingleton.getInstance().translate("Import failed"), JOptionPane.ERROR_MESSAGE);
+                            return;
+                        }
 
                         JOptionPane.showMessageDialog(getView(), LabelTranslatorSingleton.getInstance().translate("MegaBasterd will restart"), LabelTranslatorSingleton.getInstance().translate("Restart required"), JOptionPane.WARNING_MESSAGE);
 
@@ -1205,105 +1670,218 @@ public final class MainPanel {
 
             if (!_download_manager.getTransference_running_list().isEmpty() || !_upload_manager.getTransference_running_list().isEmpty() || !_download_manager.getTransference_waitstart_queue().isEmpty() || !_upload_manager.getTransference_waitstart_queue().isEmpty()) {
 
+                // Hard cap on the graceful drain. Without this the dialog can sit
+                // indefinitely waiting for workers that are blocked inside a 60s
+                // HTTP read timeout (or repeatedly on consecutive 509 backoffs);
+                // the user ends up clicking EXIT NOW anyway. After this much wall
+                // time we just call byebyenow ourselves -- the queue has already
+                // been persisted upfront, so nothing is lost. (#751)
+                final long SHUTDOWN_HARD_TIMEOUT_MS = 30_000L;
+
+                final WarningExitMessage exit_message = new WarningExitMessage(getView(), true, this, restart);
+
                 THREAD_POOL.execute(() -> {
-                    boolean wait;
-                    do {
-                        wait = false;
-                        if (!_download_manager.getTransference_running_list().isEmpty()) {
-                            for (Transference trans : _download_manager.getTransference_running_list()) {
-                                Download download = (Download) trans;
-                                if (download.isPaused()) {
-                                    download.pause();
-                                }
-                                if (!download.getChunkworkers().isEmpty()) {
-                                    wait = true;
-                                    MiscTools.GUIRun(() -> {
-                                        download.getView().printStatusNormal("Stopping download safely before exit MegaBasterd, please wait...");
-                                        download.getView().getSlots_spinner().setEnabled(false);
-                                        download.getView().getPause_button().setEnabled(false);
-                                        download.getView().getCopy_link_button().setEnabled(false);
-                                        download.getView().getOpen_folder_button().setEnabled(false);
-                                        download.getView().getFile_size_label().setEnabled(false);
-                                        download.getView().getFile_name_label().setEnabled(false);
-                                        download.getView().getSpeed_label().setEnabled(false);
-                                        download.getView().getSlots_label().setEnabled(false);
-                                        download.getView().getProgress_pbar().setEnabled(false);
-                                    });
-                                }
-                            }
-                        }
-                        if (!_upload_manager.getTransference_running_list().isEmpty()) {
-                            for (Transference trans : _upload_manager.getTransference_running_list()) {
-                                Upload upload = (Upload) trans;
-                                upload.getMac_generator().secureNotify();
-                                if (upload.isPaused()) {
-                                    upload.pause();
-                                }
-                                if (!upload.getChunkworkers().isEmpty()) {
-                                    wait = true;
-                                    MiscTools.GUIRun(() -> {
-                                        upload.getView().printStatusNormal("Stopping upload safely before exit MegaBasterd, please wait...");
-                                        upload.getView().getSlots_spinner().setEnabled(false);
-                                        upload.getView().getPause_button().setEnabled(false);
-                                        upload.getView().getFolder_link_button().setEnabled(false);
-                                        upload.getView().getFile_link_button().setEnabled(false);
-                                        upload.getView().getFile_size_label().setEnabled(false);
-                                        upload.getView().getFile_name_label().setEnabled(false);
-                                        upload.getView().getSpeed_label().setEnabled(false);
-                                        upload.getView().getSlots_label().setEnabled(false);
-                                        upload.getView().getProgress_pbar().setEnabled(false);
-                                    });
-                                } else {
-                                    try {
-                                        DBTools.updateUploadProgress(upload.getFile_name(), upload.getMa().getFull_email(), upload.getProgress(), upload.getTemp_mac_data() != null ? upload.getTemp_mac_data() : null);
-                                    } catch (SQLException ex) {
-                                        Logger.getLogger(MainPanel.class.getName()).log(Level.SEVERE, ex.getMessage());
-                                    }
-                                }
-                            }
-                        }
 
-                        ArrayList<String> downloads_queue = new ArrayList<>(), uploads_queue = new ArrayList<>();
+                    final long start = System.currentTimeMillis();
 
-                        for (Transference t : _download_manager.getTransference_running_list()) {
-                            downloads_queue.add(((Download) t).getUrl());
+                    // -------------------------------------------------------------
+                    // 1) Snapshot the queue UPFRONT and persist it once.
+                    //    The previous code rebuilt this snapshot every iteration
+                    //    of the drain loop, which meant a download that exited
+                    //    between two iterations dropped out of the persisted set
+                    //    (its URL never made it to download_queue). Doing it once
+                    //    here -- before any transference has had a chance to exit
+                    //    -- guarantees the full resume set survives across the
+                    //    app restart. (#751)
+                    // -------------------------------------------------------------
+                    // Capture every download URL still in flight, in priority
+                    // order. Previously this only covered running_list +
+                    // waitstart_queue: anything mid-provisioning, anything in
+                    // the aux flush queue, and any URL the new-download
+                    // Runnable had pasted but not yet converted to a Download
+                    // was lost silently on exit. Now we union all four
+                    // download-side sources so a user who exits mid-batch
+                    // recovers the full set on next launch.
+                    java.util.LinkedHashSet<String> downloads_set = new java.util.LinkedHashSet<>();
+                    for (Transference t : _download_manager.getTransference_running_list()) {
+                        downloads_set.add(((Download) t).getUrl());
+                    }
+                    for (Transference t : _download_manager.getTransference_waitstart_queue()) {
+                        downloads_set.add(((Download) t).getUrl());
+                    }
+                    for (Transference t : _download_manager.getTransference_waitstart_aux_queue()) {
+                        downloads_set.add(((Download) t).getUrl());
+                    }
+                    for (Transference t : _download_manager.getTransference_provision_queue()) {
+                        downloads_set.add(((Download) t).getUrl());
+                    }
+                    // _transference_preprocess_global_queue carries Strings on
+                    // the download side (raw URLs the user pasted that have
+                    // not yet been converted to Download objects); the upload
+                    // side stores File objects so we filter by type.
+                    for (Object o : _download_manager.getTransference_preprocess_global_queue()) {
+                        if (o instanceof String) {
+                            downloads_set.add((String) o);
                         }
+                    }
+                    ArrayList<String> downloads_queue = new ArrayList<>(downloads_set);
 
-                        for (Transference t : _download_manager.getTransference_waitstart_queue()) {
-                            downloads_queue.add(((Download) t).getUrl());
-                        }
+                    // Same widening as the download side: capture every
+                    // upload in flight, in priority order, so a mid-batch
+                    // exit doesn't drop the aux flush queue or anything
+                    // mid-provisioning. preprocess_global_queue on the
+                    // upload side carries File objects (not Upload objects),
+                    // so we capture their absolute path as the file_name --
+                    // resumeUploads will only re-create them if their DB row
+                    // already exists (which only happens after provisionIt
+                    // ran), so the preprocess_global File entries serve as
+                    // a debugging trail rather than full recovery.
+                    java.util.LinkedHashSet<String> uploads_set = new java.util.LinkedHashSet<>();
+                    for (Transference t : _upload_manager.getTransference_running_list()) {
+                        uploads_set.add(t.getFile_name());
+                    }
+                    for (Transference t : _upload_manager.getTransference_waitstart_queue()) {
+                        uploads_set.add(t.getFile_name());
+                    }
+                    for (Transference t : _upload_manager.getTransference_waitstart_aux_queue()) {
+                        uploads_set.add(t.getFile_name());
+                    }
+                    for (Transference t : _upload_manager.getTransference_provision_queue()) {
+                        uploads_set.add(t.getFile_name());
+                    }
+                    ArrayList<String> uploads_queue = new ArrayList<>(uploads_set);
 
-                        for (Transference t : _upload_manager.getTransference_running_list()) {
-                            uploads_queue.add(t.getFile_name());
-                        }
-
-                        for (Transference t : _upload_manager.getTransference_waitstart_queue()) {
-                            uploads_queue.add(t.getFile_name());
-                        }
-
+                    // Save per-upload progress (mac data) up front too, so a
+                    // resume picks up close to the byte that was being chunked
+                    // when the user clicked exit.
+                    for (Transference t : _upload_manager.getTransference_running_list()) {
+                        Upload upload = (Upload) t;
                         try {
-                            DBTools.truncateDownloadsQueue();
-                            DBTools.insertDownloadsQueue(downloads_queue);
-
-                            DBTools.truncateUploadsQueue();
-                            DBTools.insertUploadsQueue(uploads_queue);
+                            DBTools.updateUploadProgress(upload.getFile_name(), upload.getMa().getFull_email(), upload.getProgress(), upload.getTemp_mac_data() != null ? upload.getTemp_mac_data() : null);
                         } catch (SQLException ex) {
-                            Logger.getLogger(MainPanel.class.getName()).log(Level.SEVERE, null, ex);
+                            Logger.getLogger(MainPanel.class.getName()).log(Level.SEVERE, ex.getMessage());
+                        }
+                    }
+
+                    boolean db_ok = true;
+                    try {
+                        DBTools.truncateDownloadsQueue();
+                        DBTools.insertDownloadsQueue(downloads_queue);
+                        DBTools.truncateUploadsQueue();
+                        DBTools.insertUploadsQueue(uploads_queue);
+                    } catch (SQLException ex) {
+                        db_ok = false;
+                        Logger.getLogger(MainPanel.class.getName()).log(Level.SEVERE, null, ex);
+                    }
+                    exit_message.setDbSaved(db_ok);
+
+                    // -------------------------------------------------------------
+                    // 2) Wake every worker and cut in-flight I/O.
+                    //    ChunkDownloader.RESET_CURRENT_CHUNK() closes the current
+                    //    chunk InputStream, which forces any blocking read() /
+                    //    getResponseCode() to throw IOException promptly instead
+                    //    of waiting out the 60s HTTP_READ_TIMEOUT. The worker's
+                    //    outer-loop then sees main_panel.isExit() == true and
+                    //    exits. Without this, the drain loop could legitimately
+                    //    sit for ~60s per stuck worker. (#751)
+                    // -------------------------------------------------------------
+                    for (Transference trans : _download_manager.getTransference_running_list()) {
+                        Download download = (Download) trans;
+                        if (download.isPaused()) {
+                            download.pause();
+                        }
+                        MiscTools.GUIRun(() -> {
+                            download.getView().printStatusNormal("Stopping download safely before exit MegaBasterd, please wait...");
+                            download.getView().getSlots_spinner().setEnabled(false);
+                            download.getView().getPause_button().setEnabled(false);
+                            download.getView().getCopy_link_button().setEnabled(false);
+                            download.getView().getOpen_folder_button().setEnabled(false);
+                            download.getView().getFile_size_label().setEnabled(false);
+                            download.getView().getFile_name_label().setEnabled(false);
+                            download.getView().getSpeed_label().setEnabled(false);
+                            download.getView().getSlots_label().setEnabled(false);
+                            download.getView().getProgress_pbar().setEnabled(false);
+                        });
+                        for (ChunkDownloader cd : download.getChunkworkers()) {
+                            try {
+                                cd.RESET_CURRENT_CHUNK();
+                            } catch (Exception ignore) {
+                            }
+                            cd.secureNotify();
+                        }
+                    }
+                    for (Transference trans : _upload_manager.getTransference_running_list()) {
+                        Upload upload = (Upload) trans;
+                        if (upload.getMac_generator() != null) {
+                            upload.getMac_generator().secureNotify();
+                        }
+                        if (upload.isPaused()) {
+                            upload.pause();
+                        }
+                        MiscTools.GUIRun(() -> {
+                            upload.getView().printStatusNormal("Stopping upload safely before exit MegaBasterd, please wait...");
+                            upload.getView().getSlots_spinner().setEnabled(false);
+                            upload.getView().getPause_button().setEnabled(false);
+                            upload.getView().getFolder_link_button().setEnabled(false);
+                            upload.getView().getFile_link_button().setEnabled(false);
+                            upload.getView().getFile_size_label().setEnabled(false);
+                            upload.getView().getFile_name_label().setEnabled(false);
+                            upload.getView().getSpeed_label().setEnabled(false);
+                            upload.getView().getSlots_label().setEnabled(false);
+                            upload.getView().getProgress_pbar().setEnabled(false);
+                        });
+                        for (ChunkUploader cu : upload.getChunkworkers()) {
+                            cu.secureNotify();
+                        }
+                    }
+
+                    // -------------------------------------------------------------
+                    // 3) Drain loop with live status push and hard timeout.
+                    // -------------------------------------------------------------
+                    boolean wait;
+                    boolean timed_out = false;
+                    do {
+                        int dl_count = 0, dl_workers = 0, ul_count = 0, ul_workers = 0;
+
+                        for (Transference trans : _download_manager.getTransference_running_list()) {
+                            Download download = (Download) trans;
+                            dl_count++;
+                            dl_workers += download.getChunkworkers().size();
+                        }
+                        for (Transference trans : _upload_manager.getTransference_running_list()) {
+                            Upload upload = (Upload) trans;
+                            ul_count++;
+                            ul_workers += upload.getChunkworkers().size();
+                        }
+
+                        wait = (dl_workers > 0 || ul_workers > 0);
+
+                        long elapsed = System.currentTimeMillis() - start;
+                        exit_message.updateStatus(dl_count, dl_workers, ul_count, ul_workers, elapsed, SHUTDOWN_HARD_TIMEOUT_MS);
+
+                        if (elapsed >= SHUTDOWN_HARD_TIMEOUT_MS) {
+                            timed_out = true;
+                            break;
                         }
 
                         if (wait) {
-
                             try {
-                                Thread.sleep(1000);
+                                Thread.sleep(500);
                             } catch (InterruptedException ex) {
+                                Thread.currentThread().interrupt();
                                 Logger.getLogger(MainPanel.class.getName()).log(Level.SEVERE, ex.getMessage());
+                                break;
                             }
                         }
                     } while (wait);
+
+                    if (timed_out) {
+                        Logger.getLogger(MainPanel.class.getName()).log(Level.WARNING,
+                                "Shutdown drain hit {0}ms hard timeout -- forcing exit", SHUTDOWN_HARD_TIMEOUT_MS);
+                    }
+
                     byebyenow(restart);
                 });
-
-                WarningExitMessage exit_message = new WarningExitMessage(getView(), true, this, restart);
 
                 exit_message.setLocationRelativeTo(getView());
 
@@ -1443,6 +2021,18 @@ public final class MainPanel {
                                 } else {
                                     tot_downloads--;
                                 }
+                            } else {
+                                // URL is in downloads_queue but has no row in
+                                // `downloads` -- it was in provision_queue /
+                                // preprocess_global_queue at shutdown and
+                                // never reached insertDownloadReturningName.
+                                // Build a metadata-less Download against the
+                                // default download path so the user gets it
+                                // back instead of seeing it vanish.
+                                Download download = new Download(tthis, new MegaAPI(), url, _default_download_path, null, null, null, null, null, _use_slots_down, false, null, false);
+                                getDownload_manager().getTransference_provision_queue().add(download);
+                                conta_downloads++;
+                                downloads_queue_iterator.remove();
                             }
 
                         } catch (Exception ex) {
